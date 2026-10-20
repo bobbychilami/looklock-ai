@@ -11,25 +11,28 @@ import asyncio
 import json
 import random
 import struct
+import zlib
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.api.deps import youcam_service_dependency
+from app.api.deps import catalog_provider_dependency, youcam_service_dependency
 from app.api.routes.catalog import OCCASION_ORDER, STYLE_ORDER
 from app.catalog import (
     ASSETS_DIR,
     Product,
     ProductImage,
+    ProductQuery,
     ProductSource,
-    asset_path,
+    ProviderInfo,
     get_catalogue,
     get_source,
     require_reference,
 )
 from app.catalog.product import ProductNotFoundError
+from app.catalog.repository import product_asset_path
 from app.core.config import Settings
 from app.core.image_validation import ValidatedImage
 from app.main import create_app
@@ -45,6 +48,7 @@ from app.recommendations import (
 from app.services.tryon import (
     PHASE_SEQUENCE,
     TryOnJob,
+    TryOnReference,
     TryOnRunner,
     get_tryon_job_store,
     reset_tryon_jobs,
@@ -89,13 +93,68 @@ def test_catalogue_meets_the_documented_size_targets() -> None:
 def test_every_catalogue_asset_exists_and_is_a_real_png() -> None:
     """The seed data and the generated artwork must not drift apart."""
     for product in CATALOGUE:
-        path = asset_path(product)
+        path = product_asset_path(product)
         data = path.read_bytes()
         assert data[:8] == b"\x89PNG\r\n\x1a\n", f"{product.product_id} is not a PNG"
         # IHDR is the first chunk: length, type, then width and height.
         assert data[12:16] == b"IHDR"
         width, height = struct.unpack(">II", data[16:24])
         assert (width, height) == (1000, 1250)
+
+
+def test_catalogue_artwork_is_shaded_rather_than_flat_fills() -> None:
+    """Guards the studio-render upgrade in `tools/generate_catalog_assets.py`.
+
+    A flat silhouette fill passes every other asset check - valid PNG, right size,
+    right filename - while looking like clip art. Luminance spread across the
+    garment area is the cheapest signal that the shading pipeline is still wired
+    up: real cloth under a key light has highlights and shadows, a flat fill has
+    one colour.
+    """
+    for product in CATALOGUE:
+        data = product_asset_path(product).read_bytes()
+        width, height = struct.unpack(">II", data[16:24])
+        pixels = _decode_png(data, width, height)
+
+        # Sample the middle of the frame, where the garment always is, skipping
+        # the paper backdrop at the edges.
+        lums: list[float] = []
+        for y in range(280, height - 150, 11):
+            row = pixels[y]
+            for x in range(220, width - 220, 11):
+                at = x * 3
+                lums.append(
+                    0.299 * row[at] + 0.587 * row[at + 1] + 0.114 * row[at + 2]
+                )
+        lums.sort()
+        spread = lums[-1] - lums[0]
+        assert spread > 45, (
+            f"{product.product_id} looks like a flat fill "
+            f"(luminance spread {spread:.1f}); the shading pipeline is not running"
+        )
+
+
+def _decode_png(data: bytes, width: int, height: int) -> list[memoryview]:
+    """Decode a filter-type-0 RGB PNG into per-row views. Generator output only.
+
+    The generator writes every scanline with filter type 0, so this is a straight
+    inflate with no unfiltering - and it keeps the test free of an image library
+    dependency for a project that has none on purpose.
+    """
+    idat = bytearray()
+    cursor = 8
+    while cursor < len(data):
+        length = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        tag = data[cursor + 4 : cursor + 8]
+        if tag == b"IDAT":
+            idat += data[cursor + 8 : cursor + 8 + length]
+        cursor += 12 + length
+    raw = zlib.decompress(bytes(idat))
+    stride = width * 3
+    return [
+        memoryview(raw)[(y * (stride + 1)) + 1 : (y + 1) * (stride + 1)]
+        for y in range(height)
+    ]
 
 
 def test_asset_directory_contains_no_unreferenced_images() -> None:
@@ -119,6 +178,34 @@ def test_accessories_are_not_tryon_capable() -> None:
                 require_reference(product)
         else:
             assert product.is_tryon_capable
+
+
+def test_bundled_assets_are_not_flagged_as_remote() -> None:
+    # Every demo piece is a local asset we upload ourselves, so none of them is a
+    # remote image the vendor would have to fetch.
+    for product in CATALOGUE:
+        if product.is_tryon_capable:
+            assert not product.tryon_uses_remote_image
+
+
+def test_remote_reference_is_flagged_even_when_tryon_capable() -> None:
+    # A live listing whose only garment image is a retailer/CDN URL is technically
+    # tryon-capable at the model level, but the engine has to fetch it and we cannot
+    # guarantee the service accepts it yet - so the flag must reach the wire and the
+    # UI keeps try-on disabled for it.
+    linked = Product(
+        product_id="linked",
+        name="Linked",
+        slot="top",
+        image=ProductImage(url="https://cdn.example.com/garment.jpg"),
+        price_inr=2000,
+        styles=("Minimal",),
+        occasions=("Casual",),
+        description="A live listing.",
+        color="Ivory",
+    )
+    assert linked.is_tryon_capable
+    assert linked.tryon_uses_remote_image
 
 
 def test_tryon_capable_products_declare_a_vendor_garment_category() -> None:
@@ -224,8 +311,11 @@ def test_every_look_has_a_top_and_a_bottom() -> None:
     for look in result.looks:
         slots = {item.slot for item in look.items}
         assert {"top", "bottom"} <= slots
-        # The try-on reference is the top piece, and tops are never accessories.
-        assert look.hero.slot == "top"
+        # The try-on reference is the outermost worn garment: the outer layer when
+        # the look has one, otherwise the top. It is never an accessory, which is
+        # display-only and cannot be sent to the vendor.
+        assert look.hero.slot in {"outerwear", "top"}
+        assert look.hero.is_tryon_capable
 
 
 def test_look_total_price_is_the_sum_of_its_items() -> None:
@@ -327,6 +417,136 @@ def test_thin_catalogue_returns_what_it_can_with_a_notice() -> None:
     assert not result.is_complete
 
 
+def test_the_cheapest_preset_is_fully_met_for_a_casual_occasion() -> None:
+    """The lowest budget tier must actually be spendable somewhere in the app.
+
+    Every occasion answering the questionnaire is checked for *some* budget that
+    works, but only the deliberately-inexpensive occasions are required to work at
+    the very bottom of the ladder.
+    """
+    smallest = min(BUDGET_PRESETS_INR)
+    result = recommend(
+        _request(occasion="Vacation", style="Minimal", budget_inr=smallest),
+        CATALOGUE,
+        image_url_for=_url,
+    )
+    assert result.looks
+    in_budget = [look for look in result.looks if look.total_price_inr <= smallest]
+    assert in_budget, (
+        f"the ₹{smallest:,} preset must produce at least one affordable look"
+    )
+    # Whether the *other two* fits in budget is a question about how much the
+    # catalogue contains, not about whether the smallest tier is real. When they
+    # are not, the response has to say so.
+    if len(in_budget) < len(result.looks):
+        assert "budget" in result.relaxed_constraints
+        assert result.notice is not None
+
+
+def test_every_occasion_can_be_afforded_by_at_least_one_budget_preset() -> None:
+    """No occasion may be unreachable at every price the app offers.
+
+    The cheapest possible look for an occasion is computed from the catalogue
+    directly rather than from the three looks the engine happens to return, so a
+    high-ranked-but-expensive result cannot fail this check.
+    """
+    for occasion in OCCASION_ORDER:
+        tops = [p for p in CATALOGUE if p.slot == "top" and p.matches_occasion(occasion)]
+        bottoms = [
+            p for p in CATALOGUE if p.slot == "bottom" and p.matches_occasion(occasion)
+        ]
+        if not tops or not bottoms:
+            continue  # engine raises InsufficientInventoryError; covered elsewhere
+        floor = min(t.price_inr for t in tops) + min(b.price_inr for b in bottoms)
+        assert any(preset >= floor for preset in BUDGET_PRESETS_INR), (
+            f"no budget preset reaches the cheapest {occasion} look (₹{floor:,})"
+        )
+
+
+def test_an_unaffordable_occasion_says_so_rather_than_pretending() -> None:
+    """A formal occasion at a casual budget must not be answered with casual wear.
+
+    This is the honest-failure half of the budget contract. The catalogue has a
+    ₹1,600 outfit and a ₹2,000 budget, so a naive "always fill three looks" engine
+    happily dresses a wedding shopper in a cotton mandarin shirt. Being affordable
+    is not the same as being an answer to the question, so the notice has to admit
+    the shortfall and name the real price of being correctly dressed.
+    """
+    result = recommend(
+        _request(occasion="Wedding", style="Classic", budget_inr=2000),
+        CATALOGUE,
+        image_url_for=_url,
+    )
+    assert result.looks, "the shopper should still get options"
+    assert "budget" in result.relaxed_constraints
+    assert result.notice is not None
+    assert "₹" in result.notice
+    assert all(look.total_price_inr > 2000 for look in result.looks)
+    for look in result.looks:
+        hero = next(item for item in look.items if item.product_id == look.hero_product_id)
+        assert hero.matches_occasion, (
+            f"{look.name} is not wedding wear and should not be offered as such"
+        )
+
+
+def test_the_notice_names_the_price_of_being_correctly_dressed() -> None:
+    """The message must be actionable: it should state the real floor, not just fail."""
+    result = recommend(
+        _request(occasion="Wedding", style="Classic", budget_inr=2000),
+        CATALOGUE,
+        image_url_for=_url,
+    )
+    assert result.notice is not None
+    cheapest = min(look.total_price_inr for look in result.looks)
+    assert f"{cheapest:,}" in result.notice, (
+        f"notice should name the cheapest real option (₹{cheapest:,}), got: "
+        f"{result.notice!r}"
+    )
+
+
+def test_looks_are_named_after_the_garment_that_defines_them() -> None:
+    """A look name is shopper-facing copy, so it has to name the right garment.
+
+    Naming from the hero makes the name follow the garment, and the hero follows
+    the outerwear-first rule, which meant a wedding look built around a sherwani
+    could be introduced as "Ceremonial Layers" because an outdoor jacket happened to
+    be the visually dominant item. The signature garment is the ceremonial piece,
+    so the name is.
+    """
+    result = recommend(
+        _request(occasion="Wedding", style="Classic", budget_inr=25000),
+        CATALOGUE,
+        image_url_for=_url,
+    )
+    sherwani_looks = [
+        look
+        for look in result.looks
+        if any("Sherwani" in item.name for item in look.items)
+    ]
+    assert sherwani_looks, "expected at least one sherwani look"
+    for look in sherwani_looks:
+        assert "Sherwani" in look.name, (
+            f"{look.name} contains a sherwani but does not name it"
+        )
+        assert "Top" not in look.name and "Piece" not in look.name, (
+            f"{look.name} leaks a placeholder noun"
+        )
+
+
+def test_cheap_occasions_do_not_need_to_relax_the_smallest_preset() -> None:
+    """The complementary case: where the budget is reachable, nothing is relaxed."""
+    for occasion in ("Vacation", "Casual", "Date Night", "Interview"):
+        result = recommend(
+            _request(occasion=occasion, style="Minimal", budget_inr=5000),
+            CATALOGUE,
+            image_url_for=_url,
+        )
+        assert result.looks, occasion
+        assert "budget" not in result.relaxed_constraints, (
+            f"{occasion} should be affordable at ₹5,000"
+        )
+
+
 def test_catalogue_without_a_bottom_cannot_build_a_look() -> None:
     tops_only = [p for p in CATALOGUE if p.slot == "top"]
     with pytest.raises(InsufficientInventoryError):
@@ -369,7 +589,13 @@ async def test_catalogue_summary_endpoint() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["product_count"] == len(CATALOGUE)
-    assert body["counts_by_slot"]["top"] == 10
+    # Counts are asserted against the live catalogue rather than hard-coded, so
+    # adding a product does not turn into a test failure unrelated to behaviour.
+    assert body["counts_by_slot"] == {
+        slot: sum(1 for p in CATALOGUE if p.slot == slot)
+        for slot in sorted({p.slot for p in CATALOGUE})
+    }
+    assert body["counts_by_slot"]["outerwear"] > 0
     assert body["occasions"] == list(OCCASION_ORDER)
     assert body["styles"] == list(STYLE_ORDER)
     assert body["budget_presets_inr"] == list(BUDGET_PRESETS_INR)
@@ -452,22 +678,36 @@ async def test_recommendations_endpoint_validates_input() -> None:
     assert extra_field.status_code == 422
 
 
-class _TinySource:
-    """A source with no bottoms, to exercise the insufficient-inventory path."""
+class _TopsOnlyProvider:
+    """A provider whose pool has no bottoms, to exercise insufficient inventory.
 
-    async def get(self, product_id: str) -> Product | None:
-        return next((p for p in CATALOGUE if p.product_id == product_id), None)
+    Overrides the `ProductProvider` seam rather than the older `ProductSource`
+    one, because that is what the recommendations route now depends on: it asks
+    for a candidate pool matching the shopper's answers, not for a whole catalogue.
+    """
 
-    async def all(self) -> list[Product]:
-        return [p for p in CATALOGUE if p.slot == "top"]
+    @property
+    def info(self) -> ProviderInfo:
+        return ProviderInfo(
+            id="test-tops-only",
+            name="Test tops only",
+            supports_shopping=False,
+            demo_imagery=True,
+        )
 
-    async def search(self, query: str, **kwargs) -> tuple[Product, ...]:
+    async def all_products(self) -> tuple[Product, ...]:
         return ()
+
+    async def search_products(self, query: ProductQuery) -> tuple[Product, ...]:
+        return tuple(p for p in CATALOGUE if p.slot == "top")
+
+    async def get_product(self, product_id: str) -> Product | None:
+        return next((p for p in CATALOGUE if p.product_id == product_id), None)
 
 
 async def test_recommendations_report_a_catalogue_that_cannot_build_a_look() -> None:
     app = _plain_app()
-    app.dependency_overrides[get_source] = lambda: _TinySource()
+    app.dependency_overrides[catalog_provider_dependency] = lambda: _TopsOnlyProvider()
     async with _client(app) as client:
         response = await client.post(
             "/api/v1/recommendations",
@@ -475,6 +715,29 @@ async def test_recommendations_report_a_catalogue_that_cannot_build_a_look() -> 
         )
     assert response.status_code == 409
     assert "bottom" in response.json()["detail"].lower()
+
+
+async def test_recommendations_conflict_when_the_provider_returns_nothing() -> None:
+    """An empty pool is a stated conflict, not an empty 200.
+
+    This is the case a real provider hits whenever it is selected but cannot
+    answer - no credentials, a throttle, a filter that matched nothing. The shopper
+    must be told why rather than shown an empty results page.
+    """
+
+    class _EmptyProvider(_TopsOnlyProvider):
+        async def search_products(self, query: ProductQuery) -> tuple[Product, ...]:
+            return ()
+
+    app = _plain_app()
+    app.dependency_overrides[catalog_provider_dependency] = lambda: _EmptyProvider()
+    async with _client(app) as client:
+        response = await client.post(
+            "/api/v1/recommendations",
+            json={"occasion": "Wedding", "style": "Classic", "budget_inr": 25000},
+        )
+    assert response.status_code == 409
+    assert "no products match" in response.json()["detail"].lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -552,7 +815,7 @@ async def test_product_tryon_runs_to_completion() -> None:
     assert recorder.task_bodies[0]["garment_category"] == product.garment_category
 
     # And the reference we uploaded must be the catalogue asset, byte for byte.
-    expected = asset_path(product).read_bytes()
+    expected = product_asset_path(product).read_bytes()
     assert expected in [content for _, content, _ in recorder.uploads]
 
 
@@ -599,12 +862,12 @@ async def test_runner_walks_every_documented_phase_in_order() -> None:
     runner = TryOnRunner(service)  # type: ignore[arg-type]
     photo = ValidatedImage(data=JPEG_BYTES, content_type="image/jpg", size_bytes=len(JPEG_BYTES))
     garment = ValidatedImage(
-        data=asset_path(CATALOGUE[0]).read_bytes(),
+        data=product_asset_path(CATALOGUE[0]).read_bytes(),
         content_type="image/png",
         size_bytes=100,
     )
     initial = job.phase
-    await runner.run(job, source=photo, reference=garment)
+    await runner.run(job, source=photo, reference=TryOnReference(image=garment))
 
     # The runner advances the phase *before* each vendor call, so recording the
     # phase at call time plus the starting and ending values reconstructs the

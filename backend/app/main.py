@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.errors import register_exception_handlers
 from app.api.routes import catalog, health, integration, look_tryon, tryon
+from app.catalog.service import close_provider_state
 from app.core.config import get_settings
 from app.services.tryon import reset_tryon_jobs
 from app.services.youcam.client import reset_youcam_client
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await reset_tryon_jobs()
         await reset_youcam_client()
+        await close_provider_state()
 
 
 def create_app() -> FastAPI:

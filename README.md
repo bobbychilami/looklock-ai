@@ -147,6 +147,16 @@ In development Vite proxies `/api` to the backend (see `frontend/vite.config.ts`
 | `frontend` | `npm run lint` | Lint (oxlint) |
 | `frontend` | `npm run preview` | Serve the production build |
 
+## Live Shopping (SerpApi Google Shopping)
+
+LOOKLOCK supports live product discovery via **SerpApi Google Shopping** (India-first). Key points:
+
+- **Providers**: `PRODUCT_PROVIDER=shopping` (live SerpApi Google Shopping, the default) or `PRODUCT_PROVIDER=amazon` (live Amazon India). The bundled demo catalogue is no longer selectable, and there is no silent fallback when a live provider is chosen but unconfigured - the app reports "no live catalogue available".
+- **URL semantics (honest links)**: If a product has a genuine direct retailer URL, we set `product_link_type="direct_retailer"` and show "Shop at {retailer}". If only a Google Shopping URL exists (no direct retailer checkout link), we set `product_link_type="google_shopping"` and show "View Product". We never fabricate retailer URLs.
+- **Budget/quotas**: Bounded fan-out (≤3 queries per recommendation), 30-minute cache (cache hits don't consume quota), and 100 searches/month (UTC rollover). Configurable via env.
+- **Security**: API key is server-side only, never logged/exposed to frontend.
+- **VTO independence**: Shopping products aren't automatically VTO-able; VTO requires valid supported assets.
+
 ## API surface
 
 | Method | Path | Purpose |

@@ -1,8 +1,16 @@
-/** Backend endpoints used by the app. */
+/**
+ * Backend endpoints used by the app.
+ *
+ * Every function returns a view model rather than a raw wire shape, so the
+ * response-shape conversions live in one file (`normalize.ts`) and the React
+ * components never branch on an API field. Nothing here calls `fetch` directly.
+ */
 
 import { apiGet, apiPostForm, apiPostJson } from './client'
+import { toCatalogueView, toProductView, toRecommendationView } from './normalize'
+import type { CatalogueView, LookView, ProductView, RecommendationView } from './normalize'
+import { formatInr } from '@/lib/format'
 import type {
-  CatalogueResponse,
   CatalogueSummary,
   HealthResponse,
   IntegrationStatusResponse,
@@ -51,32 +59,43 @@ export function getTryOnJob(jobId: string, signal?: AbortSignal) {
 }
 
 /**
- * Catalogue vocabulary and shape. Fetched rather than hard-coded so the
- * onboarding options can never drift from what the request schema accepts.
+ * Catalogue vocabulary, provider capabilities and shape.
+ *
+ * Fetched rather than hard-coded so the onboarding options can never drift from
+ * what the request schema accepts, and so the UI learns whether this deployment
+ * can produce real retailer links instead of assuming it cannot.
  */
-export function getCatalogueSummary(signal?: AbortSignal) {
-  return apiGet<CatalogueSummary>('/catalog/looks', signal)
+export async function getCatalogueSummary(signal?: AbortSignal): Promise<CatalogueView> {
+  return toCatalogueView(await apiGet<CatalogueSummary>('/catalog/looks', signal))
 }
 
-export function getCatalogue(signal?: AbortSignal) {
-  return apiGet<CatalogueResponse>('/catalog/items', signal)
-}
-
-export function getProduct(productId: string, signal?: AbortSignal) {
-  return apiGet<Product>(`/catalog/items/${encodeURIComponent(productId)}`, signal)
+export async function getProduct(
+  productId: string,
+  signal?: AbortSignal,
+): Promise<ProductView | null> {
+  const product = await apiGet<Product>(`/catalog/items/${encodeURIComponent(productId)}`, signal)
+  return toProductView(toScoredShape(product), formatInr)
 }
 
 /**
  * Rank the catalogue against the shopper's answers.
  *
  * Pure and deterministic server-side: the same answers always produce the same
- * three looks in the same order, so no client-side shuffling is needed.
+ * looks in the same order, so no client-side shuffling is needed. Budget state,
+ * look names and shoppability are all resolved here rather than in the
+ * components that render them.
  */
-export function postRecommendations(
+export async function postRecommendations(
   request: RecommendationRequest,
   signal?: AbortSignal,
-) {
-  return apiPostJson<RecommendationResponse>('/recommendations', request, signal)
+): Promise<RecommendationView> {
+  const response = await apiPostJson<RecommendationResponse>('/recommendations', request, signal)
+  return toRecommendationView(response, formatInr)
+}
+
+/** Look up one prepared look inside an already-fetched recommendation. */
+export function findLookView(view: RecommendationView, lookId: string): LookView | undefined {
+  return view.looks.find((candidate) => candidate.look.look_id === lookId)
 }
 
 /**
@@ -99,4 +118,17 @@ export function startProductTryOn(
 
 export function getProductTryOnJob(jobId: string, signal?: AbortSignal) {
   return apiGet<ProductTryOnStatusResponse>(`/tryon/${encodeURIComponent(jobId)}`, signal)
+}
+
+/**
+ * Catalogue products carry `styles[]`/`occasions[]` where a product inside a look
+ * carries two match booleans. Reuse the in-look view for a standalone product by
+ * supplying neutral match flags - nothing on the shop surface depends on them.
+ */
+function toScoredShape(product: Product) {
+  return {
+    ...product,
+    matches_occasion: false,
+    matches_style: false,
+  }
 }

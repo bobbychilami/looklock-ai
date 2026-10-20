@@ -33,6 +33,7 @@ from app.services.tryon import (
     RESULT_URL_TTL_HOURS,
     TryOnJob,
     TryOnJobStore,
+    TryOnReference,
     get_tryon_job_store,
     start_try_on_job,
 )
@@ -145,7 +146,12 @@ async def start_try_on_test(
         garment_category=garment_category,
         filter_multi_person=filter_multi_person,
     )
-    start_try_on_job(job, source=source, reference=reference, service=service)
+    start_try_on_job(
+        job,
+        source=source,
+        reference=TryOnReference(image=reference),
+        service=service,
+    )
     logger.info("Queued try-on job %s (%s)", job.job_id, garment_category)
 
     return TryOnAcceptedResponse(

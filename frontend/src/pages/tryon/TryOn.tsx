@@ -53,12 +53,27 @@ export default function TryOn() {
   const [error, setError] = useState<string | null>(null)
   const [starting, setStarting] = useState(true)
 
-  const startedRef = useRef(false)
   const pollRef = useRef<{ controller: AbortController; timer: number } | null>(null)
 
+  /**
+   * The garment the try-on will use as its reference.
+   *
+   * The route param is still a `product_id` and the request is still a single
+   * product, exactly as before - this is the same VTO path, reading the same
+   * catalogue data from a session that now holds normalised looks.
+   */
   const hero = recommendation?.looks
     .flatMap((look) => look.items)
     .find((item) => item.product_id === productId)
+
+  /**
+   * The try-on can only run for a piece the vendor can accept. An accessory has no
+   * garment reference, and a piece whose only reference is a remote/CDN image is
+   * one we hold back until we can guarantee the service accepts it - the look
+   * detail page disables the button for exactly these, and a direct visit to this
+   * route must not start a billable job the UI has already refused to offer.
+   */
+  const heroTryonReady = hero ? hero.is_tryon_capable && !hero.tryon_uses_remote_image : false
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -72,21 +87,27 @@ export default function TryOn() {
 
   useEffect(() => {
     if (!productId || !photo || !consent) return
-    if (startedRef.current) return
-    startedRef.current = true
+    if (!heroTryonReady) return
 
     const controller = new AbortController()
 
-    startProductTryOn(productId, photo, controller.signal)
-      .then((accepted) => {
-        setStarting(false)
-        poll(accepted.job_id, 0)
-      })
-      .catch((cause: unknown) => {
-        if (cause instanceof DOMException && cause.name === 'AbortError') return
-        setStarting(false)
-        setError(cause instanceof Error ? cause.message : 'Could not start the try-on.')
-      })
+    // The start is deferred by a tick. React StrictMode mounts, runs this effect,
+    // immediately tears it down and runs it again; the teardown aborts `controller`.
+    // Deferring means that first, throwaway pass cancels a *pending* start instead
+    // of a live one, so we neither fire a second billable try-on nor leave the very
+    // first request aborted (which parked the UI on "queued" forever).
+    const startTimer = window.setTimeout(() => {
+      startProductTryOn(productId, photo, controller.signal)
+        .then((accepted) => {
+          setStarting(false)
+          poll(accepted.job_id, 0)
+        })
+        .catch((cause: unknown) => {
+          if (cause instanceof DOMException && cause.name === 'AbortError') return
+          setStarting(false)
+          setError(cause instanceof Error ? cause.message : 'Could not start the try-on.')
+        })
+    }, 0)
 
     /** Recursive on purpose: each poll schedules the next, so there is exactly
      *  one outstanding request and unmounting can cancel it cleanly. */
@@ -115,14 +136,18 @@ export default function TryOn() {
         })
     }
 
-    return () => controller.abort()
-  }, [productId, photo, consent, navigate])
+    return () => {
+      window.clearTimeout(startTimer)
+      controller.abort()
+    }
+  }, [productId, photo, consent, heroTryonReady, navigate])
 
   // Refuse rather than silently failing later: without a photo or consent there
   // is nothing legal to send, and a 422 from the backend would be a worse
   // experience than saying so.
   if (!photo || !consent) return <Navigate to="/looks" replace />
   if (!hero) return <Navigate to="/looks" replace />
+  if (!heroTryonReady) return <Navigate to="/looks" replace />
 
   const activePhase = status?.phase ?? 'queued'
   const activeIndex = STEPS.findIndex((step) => step.phase === activePhase)

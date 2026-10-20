@@ -18,7 +18,8 @@
 
 import { createContext, useContext } from 'react'
 
-import type { CatalogueSummary, Occasion, RecommendationResponse, Style } from '@/api/types'
+import type { CatalogueView, RecommendationView } from '@/api/normalize'
+import type { Occasion, Style } from '@/api/types'
 
 /** Bounds for the custom budget field. Mirrors `app/recommendations/schemas.py`. */
 export const MIN_BUDGET_INR = 500
@@ -36,17 +37,18 @@ export interface LookAnswers {
 }
 
 export interface LookSession extends LookAnswers {
-  recommendation: RecommendationResponse | null
-  catalogue: CatalogueSummary | null
+  /** Normalised recommendations: look names, visuals, budget state, shoppability. */
+  recommendation: RecommendationView | null
+  catalogue: CatalogueView | null
   pending: boolean
   error: string | null
 }
 
 export type SessionAction =
-  | { type: 'catalogue'; catalogue: CatalogueSummary }
+  | { type: 'catalogue'; catalogue: CatalogueView }
   | { type: 'set'; patch: Partial<LookAnswers> }
   | { type: 'pending' }
-  | { type: 'recommended'; recommendation: RecommendationResponse }
+  | { type: 'recommended'; recommendation: RecommendationView }
   | { type: 'failed'; error: string }
   | { type: 'clear' }
 
@@ -84,7 +86,7 @@ export interface LookSessionValue extends LookSession {
   photoPreviewUrl: string | null
   setAnswers: (patch: Partial<LookAnswers>) => void
   loadCatalogue: (signal?: AbortSignal) => Promise<void>
-  buildLooks: (signal?: AbortSignal) => Promise<RecommendationResponse | null>
+  buildLooks: (signal?: AbortSignal) => Promise<RecommendationView | null>
   reset: () => void
   /** True once occasion, style, budget, photo and consent are all in place. */
   canBuild: boolean

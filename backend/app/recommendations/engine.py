@@ -14,9 +14,9 @@ Scoring has four parts, each a 0..1 ratio, combined with fixed weights:
   budget scores by utilisation, so a look that actually uses the budget beats an
   identical cheaper one; over budget is penalised and only reached when the
   catalogue cannot fill three looks otherwise.
-* **completeness** - whether footwear and an accessory are included. Required
-  slots are top and bottom, so this is a genuine ranking signal and it is also
-  what lets a small budget still produce a wearable outfit.
+* **completeness** - whether outerwear, footwear and an accessory are included.
+  Required slots are top and bottom, so this is a genuine ranking signal and it is
+  also what lets a small budget still produce a wearable outfit.
 
 When the catalogue cannot supply three looks inside the budget, constraints are
 relaxed in a fixed, stated order rather than silently.
@@ -33,6 +33,7 @@ from app.catalog.product import (
     Occasion,
     Product,
 )
+from app.recommendations.naming import build_visual, name_looks, signature_for
 from app.recommendations.schemas import (
     LookRecommendation,
     LookScore,
@@ -52,10 +53,34 @@ WEIGHTS: dict[str, float] = {
 #: How many looks to return. A product requirement, not a preference.
 LOOK_COUNT = 3
 
+def _answers_the_question(candidate: Candidate, occasion: Occasion) -> bool:
+    """Whether this look is a sensible answer to an occasion, not just affordable.
+
+    An affordable look is only useful to a shopper if it is also something they
+    could actually wear to the event. A ₹1,600 cotton mandarin shirt fits a ₹2,000
+    budget perfectly and is not wedding wear, so offering it purely on price
+    answers a question nobody asked - and worse, it displaces the honest answer.
+
+    The test is the look's *main* garment, not all of them. "Wedding/Classic at
+    ₹8,000" should still offer a kurta with a churidar, and a churidar or trousers
+    are shared across occasions by design. Requiring every item to match would
+    reject those legitimate combinations and push the shopper towards ₹24,800
+    sherwanis they did not ask for.
+    """
+    return candidate.hero.matches_occasion(occasion)
+
 #: Maximum number of shared product ids between two looks. Keeps the three
 #: suggestions genuinely different outfits rather than three variations on one.
 IDEAL_MAX_SHARED = 1
 FALLBACK_MAX_SHARED = 2
+
+#: The ladder of "maximum product ids two looks may share", tried in order until
+#: three looks can be built. Zero comes first: three *fully* distinct outfits are
+#: the ideal, and one staple piece repeated across every card is exactly what makes
+#: a grid read as a single look shown three times. The ladder loosens only when the
+#: catalogue genuinely cannot supply three separate outfits, and the first look is
+#: unaffected by the choice (it is always the top-ranked candidate).
+_MAX_SHARED_LADDER: tuple[int, ...] = (0, IDEAL_MAX_SHARED, FALLBACK_MAX_SHARED)
 
 #: Ceiling for the budget component of an over-budget look. Strictly below 1.0
 #: so satisfying the budget always outranks exceeding it.
@@ -76,10 +101,19 @@ class Candidate:
     bottom: Product
     footwear: Product | None
     accessory: Product | None
+    outerwear: Product | None = None
 
     @property
     def items(self) -> tuple[Product, ...]:
+        """Every piece, in dressing order.
+
+        The order is canonical rather than incidental: the complete-look visual
+        composes these top to bottom, and the shopping breakdown reads in the same
+        order.
+        """
         found = [self.top, self.bottom]
+        if self.outerwear is not None:
+            found.append(self.outerwear)
         if self.footwear is not None:
             found.append(self.footwear)
         if self.accessory is not None:
@@ -90,6 +124,8 @@ class Candidate:
     def wearable(self) -> tuple[Product, ...]:
         """Pieces a person actually wears. Accessories do not count for fit."""
         found = [self.top, self.bottom]
+        if self.outerwear is not None:
+            found.append(self.outerwear)
         if self.footwear is not None:
             found.append(self.footwear)
         return tuple(found)
@@ -102,6 +138,8 @@ class Candidate:
     def key(self) -> str:
         """Stable identity, used for deterministic tie-breaking."""
         parts = [self.top.product_id, self.bottom.product_id]
+        if self.outerwear is not None:
+            parts.append(self.outerwear.product_id)
         if self.footwear is not None:
             parts.append(self.footwear.product_id)
         if self.accessory is not None:
@@ -112,25 +150,35 @@ class Candidate:
     def hero(self) -> Product:
         """The garment sent as the try-on reference.
 
-        V4.0 accepts one reference garment per request, so the top piece anchors
-        the look. A future full-body pass would instead use a `full_body` asset.
+        V4.0 accepts exactly one reference garment per request, so this is a
+        deliberate limitation rather than a rendering choice: the preview shows the
+        shopper how *this piece* sits on them, not a composite of the whole outfit.
+
+        Outerwear is preferred when present, because a jacket worn open is the
+        outermost silhouette and reads closest to the finished look. Otherwise the
+        top anchors it. A provider can point `vto_asset` at a full-body shot when
+        one exists, which is the only way to preview a complete outfit.
         """
-        return self.top
+        return self.outerwear if self.outerwear is not None else self.top
 
 
 def build_candidates(
     catalogue: Sequence[Product], *, occasion: Occasion | None = None
 ) -> tuple[Candidate, ...]:
-    """Every top x bottom x optional-footwear x optional-accessory outfit.
+    """Every top x bottom x optional-outer x optional-footwear x optional-accessory outfit.
 
-    The full cross product is cheap at this catalogue size (a few thousand rows)
-    and avoids the arbitrariness of hand-curated outfit lists: ranking decides
+    The full cross product is cheap at this catalogue size (tens of thousands of
+    rows) and avoids the arbitrariness of hand-curated outfit lists: ranking decides
     what a shopper sees, not the order someone happened to write the seed down.
 
     When an occasion is given, the accessory pool is narrowed to pieces tagged
     for it. Accessories are deliberately excluded from the occasion and style
     *scores* - a belt does not change how well a fit suits someone - so without
     this filter a wedding look could quietly contain an interview-only belt.
+
+    Outerwear is *not* narrowed this way. A jacket changes the silhouette, so it
+    is scored on occasion and style like any other worn piece, and the ranking is
+    what keeps a casual trucker out of a wedding look.
     """
     tops = [item for item in catalogue if item.slot == "top"]
     bottoms = [item for item in catalogue if item.slot == "bottom"]
@@ -141,6 +189,7 @@ def build_candidates(
             "At least one top and one bottom are required."
         )
 
+    outerwear: list[Product | None] = [None, *[i for i in catalogue if i.slot == "outerwear"]]
     footwear: list[Product | None] = [None, *[i for i in catalogue if i.slot == "footwear"]]
     all_accessories = [i for i in catalogue if i.slot == "accessory"]
     if occasion is not None:
@@ -151,8 +200,10 @@ def build_candidates(
     accessories: list[Product | None] = [None, *all_accessories]
 
     return tuple(
-        Candidate(top=top, bottom=bottom, footwear=shoe, accessory=extra)
-        for top, bottom, shoe, extra in cartesian(tops, bottoms, footwear, accessories)
+        Candidate(top=top, bottom=bottom, footwear=shoe, accessory=extra, outerwear=coat)
+        for top, bottom, coat, shoe, extra in cartesian(
+            tops, bottoms, outerwear, footwear, accessories
+        )
     )
 
 
@@ -246,7 +297,9 @@ def _reasons(
     else:
         reasons.append(f"₹{total:,} - ₹{total - budget:,} over your budget")
 
-    if candidate.footwear is not None and candidate.accessory is not None:
+    if candidate.outerwear is not None and candidate.footwear is not None:
+        reasons.append("Complete look, layered and finished")
+    elif candidate.footwear is not None and candidate.accessory is not None:
         reasons.append("Complete look, footwear and finishing piece included")
     elif candidate.footwear is not None:
         reasons.append("Includes footwear")
@@ -256,6 +309,21 @@ def _reasons(
 def _shared_ids(chosen: Sequence[Candidate], candidate: Candidate) -> int:
     picked = {item.product_id for look in chosen for item in look.items}
     return len(picked & {item.product_id for item in candidate.items})
+
+
+def _styled_shot_for(candidate: Candidate) -> str | None:
+    """The best available worn shot for a look, if any item publishes one.
+
+    Outerwear first, then the hero, then anything else. The demo catalogue
+    publishes none, so this returns `None` there and the look is composed from its
+    product images instead.
+    """
+    ordered = [candidate.hero, *candidate.items]
+    for product in ordered:
+        shot = product.has_styled_shot
+        if shot:
+            return shot
+    return None
 
 
 def _select(
@@ -268,7 +336,7 @@ def _select(
     as that one look with a notice, not as an error.
     """
     best: tuple[list[Candidate], list[LookScore]] = ([], [])
-    for max_shared in (IDEAL_MAX_SHARED, FALLBACK_MAX_SHARED, len(ranked) or 1):
+    for max_shared in (*_MAX_SHARED_LADDER, len(ranked) or 1):
         chosen: list[Candidate] = []
         scores: list[LookScore] = []
         for candidate, score in ranked:
@@ -296,15 +364,37 @@ def recommend(
     scored.sort(key=lambda row: (-row[1].total, row[0].key))
 
     in_budget = [row for row in scored if row[0].total_price_inr <= request.budget_inr]
-    if len(in_budget) >= LOOK_COUNT:
-        pool = in_budget
+    over = [row for row in scored if row[0].total_price_inr > request.budget_inr]
+
+    # An affordable look is only an answer if it is also an answer to the question
+    # the shopper actually asked. Someone shopping for wedding clothes should not
+    # be shown a ₹1,600 cotton mandarin shirt merely because it fits ₹2,000; the
+    # ₹24,800 bandhgala they cannot afford is a far more useful answer to "what do
+    # I wear to a wedding", and the notice explains the gap.
+    on_occasion = [
+        row
+        for row in in_budget
+        if _answers_the_question(row[0], request.occasion)
+    ]
+    affordable_and_sensible = on_occasion or ([] if over else in_budget)
+
+    if len(affordable_and_sensible) >= LOOK_COUNT:
+        pool = affordable_and_sensible
+    elif affordable_and_sensible:
+        # Some looks fit and some do not. Keep the affordable ones first and only
+        # pad with over-budget options to reach LOOK_COUNT.
+        #
+        # Taking `over` alone - the previous behaviour - meant that a shopper who
+        # could afford ₹1,600 of clothes was shown three outfits costing ₹8,000-12,700
+        # and told the budget had been relaxed. The affordable outfit existed; it
+        # was thrown away because three of them could not be found. A shopper who
+        # sets a budget is better served by being shown what they can actually
+        # buy and told the alternatives cost more.
+        pool = affordable_and_sensible + over
     else:
-        over = [row for row in scored if row[0].total_price_inr > request.budget_inr]
-        # When the budget cannot be met, `_budget_score` being monotonic means the
-        # existing score order already puts the closest match first among looks
-        # that are otherwise equally good on occasion and style - no re-sorting
-        # needed. If nothing exceeds the budget at all, the catalogue is simply
-        # too small to make three looks and `_notice` reports that instead.
+        # Nothing affordable is appropriate for this occasion. Every candidate is
+        # over budget, so `over` is everything and the score order stands.
+        # `_notice` reports the shortfall.
         pool = over or in_budget
 
     chosen, scores = _select(pool, LOOK_COUNT)
@@ -313,10 +403,19 @@ def recommend(
             "The catalogue is too small to build a complete look from a top and a bottom."
         )
 
+    # Naming and visual strategy are derived from the *chosen* set, not from the
+    # request, so two looks that happen to share a signature piece still end up
+    # with distinct names.
+    names = name_looks(
+        [(signature_for(candidate.items), candidate.bottom) for candidate in chosen],
+        request.occasion,
+    )
+
     looks = tuple(
         LookRecommendation(
             look_id=f"look-{index + 1}",
             rank=index + 1,
+            name=name,
             total_price_inr=candidate.total_price_inr,
             hero_product_id=candidate.hero.product_id,
             items=tuple(
@@ -330,11 +429,22 @@ def recommend(
             ),
             score=score,
             reasons=_reasons(candidate, request),
+            visual=build_visual(
+                [(item, image_url_for(item)) for item in candidate.items],
+                # A provider-supplied worn shot is a real photograph of the outfit,
+                # so it beats composing the look out of individual product images.
+                has_styled_shot=_styled_shot_for(candidate),
+                look_name=name,
+            ),
         )
-        for index, (candidate, score) in enumerate(zip(chosen, scores, strict=True))
+        for index, (candidate, score, name) in enumerate(
+            zip(chosen, scores, names, strict=True)
+        )
     )
 
     over_budget = [look for look in looks if look.total_price_inr > request.budget_inr]
+    # Only claim the budget was relaxed if something the shopper is being shown
+    # actually costs more than they said they would spend.
     relaxed: tuple[str, ...] = ("budget",) if over_budget else ()
     return RecommendationResponse(
         occasion=request.occasion,
@@ -361,11 +471,24 @@ def _notice(
 
     if "budget" in relaxed:
         over = [look for look in looks if look.total_price_inr > request.budget_inr]
-        if over:
+        in_budget = [look for look in looks if look.total_price_inr <= request.budget_inr]
+        if in_budget:
+            # Affordable looks come first, so the expensive ones are padding
+            # rather than substitution. Say how many are actually affordable.
+            cheapest_over = min(look.total_price_inr for look in over)
+            parts.append(
+                f"only {len(in_budget)} of these fits "
+                f"₹{request.budget_inr:,}, and the others start at ₹{cheapest_over:,}"
+            )
+        elif over:
+            # Nothing affordable is *appropriate* here, which is a different
+            # problem from the catalogue being too small. Naming the real floor
+            # tells the shopper what they would actually have to spend, instead of
+            # implying the gap is about filling three slots.
             cheapest = min(look.total_price_inr for look in over)
             parts.append(
-                f"we could not fill three looks within ₹{request.budget_inr:,}, "
-                f"so these start at ₹{cheapest:,}"
+                f"the most affordable {request.occasion.lower()} look here "
+                f"is ₹{cheapest:,}, above the ₹{request.budget_inr:,} budget"
             )
         else:
             parts.append(f"fewer than three looks fit within ₹{request.budget_inr:,}")

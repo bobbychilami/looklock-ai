@@ -11,6 +11,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import { getCatalogueSummary, getHealth, getIntegrationStatus, getReadiness } from '@/api/looklock'
+import type { CatalogueView } from '@/api/normalize'
 import type { HealthResponse, IntegrationStatusResponse, ReadyResponse } from '@/api/types'
 import { AppShell } from '@/components/layout/AppShell'
 import { Badge } from '@/components/ui/Badge'
@@ -187,17 +188,13 @@ function Row({ label, value }: { label: string; value: string }) {
 
 /** Catalogue shape, so a bad seed or a missing asset is visible immediately. */
 function CatalogueCard() {
-  const [summary, setSummary] = useState<{
-    product_count: number
-    counts_by_slot: Record<string, number>
-    notice: string
-  } | null>(null)
+  const [catalogue, setCatalogue] = useState<CatalogueView | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
     getCatalogueSummary(controller.signal)
-      .then(setSummary)
+      .then(setCatalogue)
       .catch((cause: unknown) => {
         if (cause instanceof DOMException && cause.name === 'AbortError') return
         setError(cause instanceof Error ? cause.message : 'Could not load the catalogue.')
@@ -206,19 +203,41 @@ function CatalogueCard() {
   }, [])
 
   if (error) return <p className="text-sm text-accent-700">{error}</p>
-  if (!summary) return <p className="text-sm text-ink-500">Loading catalogue...</p>
+  if (!catalogue) return <p className="text-sm text-ink-500">Loading catalogue...</p>
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap gap-2">
-        <Badge tone="neutral">{summary.product_count} products</Badge>
-        {Object.entries(summary.counts_by_slot).map(([slot, count]) => (
+        <Badge tone="neutral">{catalogue.productCount} products</Badge>
+        {Object.entries(catalogue.summary.counts_by_slot).map(([slot, count]) => (
           <Badge key={slot} tone="neutral">
             {count} {slot}
           </Badge>
         ))}
       </div>
-      <p className="text-xs text-ink-500">{summary.notice}</p>
+      {/* Provider capability, which is what decides whether the shop surface can
+          render any links at all. */}
+      <div className="flex flex-wrap gap-2">
+        {/* Availability is judged before capability: a provider that supports
+            shopping perfectly well but is unreachable right now is a different
+            fault from one that never supported it, and needs a different fix. */}
+        <Badge tone={catalogue.providerAvailable ? 'ok' : 'warn'}>
+          {catalogue.providerAvailable ? 'provider reachable' : 'provider unavailable'}
+        </Badge>
+        <Badge tone={catalogue.supportsShopping ? 'ok' : 'warn'}>
+          {catalogue.supportsShopping ? 'shopping supported' : 'no shopping'}
+        </Badge>
+        <Badge tone={catalogue.demoImagery ? 'warn' : 'ok'}>
+          {catalogue.demoImagery ? 'demo imagery' : 'real imagery'}
+        </Badge>
+        <Badge tone="neutral">{catalogue.providerName}</Badge>
+      </div>
+      {catalogue.providerUnavailableReason && (
+        <p data-testid="provider-unavailable-reason" className="text-xs text-accent-700">
+          {catalogue.providerUnavailableReason}
+        </p>
+      )}
+      <p className="text-xs text-ink-500">{catalogue.notice}</p>
     </div>
   )
 }

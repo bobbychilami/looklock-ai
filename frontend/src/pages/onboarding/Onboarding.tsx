@@ -32,6 +32,7 @@ const OCCASION_HINTS: Record<Occasion, string> = {
   Interview: 'Conservative, well-fitted, quiet',
   Party: 'Confident, you want to be looked at',
   Casual: 'Everyday, errands, meeting friends',
+  Vacation: 'Warm weather, breathable, packs light',
 }
 
 const STYLE_HINTS: Record<Style, string> = {
@@ -73,7 +74,7 @@ export default function Onboarding() {
 
   const occasions = catalogue?.occasions ?? (Object.keys(OCCASION_HINTS) as Occasion[])
   const styles = catalogue?.styles ?? (Object.keys(STYLE_HINTS) as Style[])
-  const presets = catalogue?.budget_presets_inr ?? [2000, 5000, 8000, 15000, 25000]
+  const presets = catalogue?.budgetPresets ?? [2000, 5000, 8000, 15000, 25000]
 
   const canAdvance =
     step === 0 ? Boolean(occasion) : step === 1 ? Boolean(style) : step === 2 ? Boolean(budgetInr) : Boolean(photo && consent)
@@ -164,6 +165,21 @@ export default function Onboarding() {
         {error && (
           <div className="mt-6 border-l-2 border-accent-600 bg-accent-100/40 px-4 py-3 text-sm text-accent-700">
             {error}
+          </div>
+        )}
+
+        {/* What this deployment can actually do, said once and quietly. The
+            backend knows whether a retailer is connected and whether the imagery
+            is illustrative; repeating that here stops the shopper discovering it
+            only after investing four wizard steps. */}
+        {catalogue && step === STEPS.length - 1 && (
+          <div className="mt-6 border border-ink-200 bg-paper-deep px-4 py-3">
+            <p className="text-xs leading-relaxed text-ink-700">
+              {catalogue.demoImagery && 'Product imagery in this demo is illustrative. '}
+              {catalogue.supportsShopping
+                ? 'Retailer listings are connected, so you will be able to buy the pieces in your looks.'
+                : 'No retailer is connected to this catalogue, so looks can be previewed but not yet bought.'}
+            </p>
           </div>
         )}
 

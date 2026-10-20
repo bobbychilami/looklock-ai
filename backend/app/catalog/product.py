@@ -1,18 +1,26 @@
-"""Domain model for the LOOKLOCK catalogue.
+"""Domain model for a LOOKLOCK product.
 
-Two things drive the shape of this module.
+One shape for every product the app can show, no matter where it came from.
 
-1. AI Clothes Virtual Try-On V4.0 makes a reference garment mandatory, so every
-   try-on candidate must resolve to a usable garment image. `ProductImage` is
-   therefore central rather than cosmetic, and `require_reference` fails loudly
-   when an item cannot produce one.
-2. The recommender has to *explain* its choices, so style, occasion and price are
-   first-class fields on the product rather than something derived from prose.
+Three decisions shape this module.
 
-The catalogue itself lives in `seed.py` and is served by `repository.py`. Keeping
-them separate from this file means a future crawler, PIM feed or manual dropbox
-can replace the static source without touching the recommendation engine, the
-try-on service, or the API layer.
+1. **A product is a merchant listing, not a garment.** A retailer knows the price,
+   the sizes, the colours and the page the thing is sold on. It does not know which
+   occasion you are dressing for. Style and occasion tags therefore live here as
+   *our* editorial judgement, not as vendor fields, which is why a provider is
+   responsible for filling them in even when the retailer does not supply them.
+2. **Buying and looking are different assets.** `image` is what a shopper is being
+   shown; `vto_asset` is what AI Clothes Virtual Try-On V4.0 is handed. Retailers
+   usually publish a lifestyle shot, a flat lay and sometimes a separate garment
+   cut-out, and the cut-out is the one a try-on engine wants. Keeping them apart
+   means a provider can supply a good merchandising image and a *different* try-on
+   reference without either being compromised. See `VtoAsset`.
+3. **Nothing about a listing is invented.** `retailer` and `purchase_url` are
+   optional and mean exactly "we know this" - see `can_shop`. A demo or unverified
+   product leaves them empty and the UI says so instead of linking somewhere that
+   does not sell the thing.
+
+`providers/` sits on top of this and is what the rest of the app talks to.
 """
 
 from __future__ import annotations
@@ -26,34 +34,47 @@ from app.services.youcam.schemas import GarmentCategory
 #: Style axes offered during onboarding. Order is the order shown in the UI.
 Style = Literal["Classic", "Modern", "Bold", "Minimal"]
 
-#: Occasion axes offered during onboarding.
-Occasion = Literal["Wedding", "Date Night", "Interview", "Party", "Casual"]
-
-#: Where a garment sits in an outfit.
+#: Occasion axes offered during onboarding. Order is the order shown in the UI.
 #:
-#: `top` and `bottom` are required to build a look. `footwear` and `accessory`
-#: are optional, which is what lets the engine score *completeness* as a real
-#: ranking signal rather than a formality, and what allows genuinely low budgets
-#: to produce a wearable result instead of an empty shelf.
-Slot = Literal["top", "bottom", "footwear", "accessory"]
+#: A `Literal` rather than an `Enum` so the same tuple can drive a pydantic
+#: request schema, the wizard's option list and the SQL-shaped filter in a
+#: provider without three parallel sources of truth.
+Occasion = Literal["Wedding", "Date Night", "Interview", "Party", "Casual", "Vacation"]
 
-SLOTS: tuple[Slot, ...] = ("top", "bottom", "footwear", "accessory")
+
+#: Where a garment sits in an outfit - the "category role".
+#:
+#: `top` and `bottom` are required to build a look. `outerwear`, `footwear` and
+#: `accessory` are optional, which is what lets the engine score *completeness* as
+#: a real ranking signal rather than a formality, and what allows genuinely low
+#: budgets to still produce a wearable result instead of an empty shelf.
+Slot = Literal["top", "bottom", "outerwear", "footwear", "accessory"]
+
+SLOTS: tuple[Slot, ...] = ("top", "bottom", "outerwear", "footwear", "accessory")
+
+#: Whether a listing can be bought right now, as the source describes it.
+#:
+#: `unknown` is the default rather than `out_of_stock` on purpose. A provider that
+#: was not asked, or whose API omits the field, knows nothing - and claiming
+#: "out of stock" would tell the shopper something untrue about a real listing.
+#: Only a source that explicitly reports unavailability sets `out_of_stock`.
+ProductAvailability = Literal["in_stock", "out_of_stock", "unknown"]
 
 #: Slots without which a look is not an outfit.
 REQUIRED_SLOTS: tuple[Slot, ...] = ("top", "bottom")
 
-#: Slots ordered by how much they improve a look's completeness score.
-COMPLETENESS_WEIGHTS: dict[Slot, int] = {"footwear": 2, "accessory": 1}
+#: Ordered by how much they improve a look's completeness score.
+COMPLETENESS_WEIGHTS: dict[Slot, int] = {"outerwear": 2, "footwear": 2, "accessory": 1}
 
 
 @dataclass(frozen=True)
 class ProductImage:
-    """One garment asset, addressed the ways the vendor accepts it.
+    """A merchandising image - the picture a shopper is judging the item by.
 
     `RunClothV4Task` accepts a reference as either `ref_file_id` (an image we
-    uploaded through the File API) or `ref_file_url` (a publicly reachable URL).
-    A product already present in YouCam storage fills `file_id`; one linked from
-    a partner feed fills `url`; an item in the bundled demo catalogue fills
+    uploaded through the File API) or `ref_file_url` (a publicly reachable URL),
+    and a product already present in YouCam storage fills `file_id`; one linked
+    from a retailer feed fills `url`; an item in the bundled demo catalogue fills
     `local_path` and is uploaded on first use.
 
     `local_path` is deliberately *not* usable as-is. YouCam has to fetch the
@@ -84,6 +105,34 @@ class ProductImage:
 
 
 @dataclass(frozen=True)
+class VtoAsset:
+    """A garment image chosen specifically to be sent to the try-on engine.
+
+    Separate from `Product.image` on purpose. A retailer's hero shot is often a
+    model on a styled set: it communicates the product to a human beautifully and
+    confuses a generative engine, which is trying to transfer the *garment*. When
+    a provider has a flat cut-out, that is the better reference and belongs here.
+    """
+
+    file_id: str | None = None
+    url: str | None = None
+    content_type: str | None = None
+    local_path: str | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        return bool(self.file_id or self.url)
+
+    @property
+    def needs_upload(self) -> bool:
+        return not self.is_usable and bool(self.local_path)
+
+    @property
+    def is_tryon_capable(self) -> bool:
+        return self.is_usable or self.needs_upload
+
+
+@dataclass(frozen=True)
 class Product:
     """A garment LOOKLOCK can recommend and put on a person."""
 
@@ -99,34 +148,122 @@ class Product:
     description: str
     #: Human-readable colour name, shown on the product card.
     color: str
+
+    currency: str = "INR"
+    category: str | None = None
+    subcategory: str | None = None
+    #: Every colourway the retailer lists, not just the one pictured.
+    colors: tuple[str, ...] = ()
+    #: Who sells it. `None` when the source is not a real storefront.
+    retailer: str | None = None
+    #: Where the shopper actually buys it. `None` unless genuinely verified.
+    purchase_url: str | None = None
+    #: Distinguishes direct retailer link vs Google Shopping product link.
+    product_link_type: Literal["direct_retailer", "google_shopping"] | None = None
+    #: Which provider answered, e.g. `shopping` or `amazon`. `None` for products built
+    #: before this field existed.
+    source: str | None = None
+    #: The provider's own id for the listing - an Amazon ASIN, a Myntra product
+    #: code. Kept verbatim rather than folded into `product_id` because it is the
+    #: thing an affiliate link and a later `GetItems` call are actually keyed on.
+    source_product_id: str | None = None
+    #: Whether the source says this can be bought right now, and how confident that
+    #: is. `None` means the source did not say, which is different from "no" and is
+    #: rendered differently.
+    availability: ProductAvailability = "unknown"
+    #: The try-on engine's view of the garment; falls back to `image` when absent.
+    vto_asset: VtoAsset | None = None
+    #: A shot of the garment *being worn*, when the source publishes one.
+    #:
+    #: This is the only imagery in the model that can stand in for a complete-look
+    #: photograph, and it is the reason `recommendations/naming.py` prefers it. It
+    #: is deliberately not the default: a styled shot shows a model in a full
+    #: outfit, so using it as *the* product image would attribute other garments
+    #: to this product.
+    styled_image: ProductImage | None = None
     #: Only set when the source knows it. The engine can classify the garment
     #: itself when passed `auto`, so this is a hint, not a requirement.
     garment_category: GarmentCategory | None = None
     brand: str | None = None
-    #: Where a shopper would go. Display-only. Always `None` in the demo
-    #: catalogue: inventing retailer links would misrepresent products that do
-    #: not exist, so the UI says "demo product" instead.
-    purchase_url: str | None = None
 
     @property
     def primary_style(self) -> Style | None:
         return self.styles[0] if self.styles else None
 
     @property
+    def tryon_reference(self) -> ProductImage | VtoAsset | None:
+        """The asset a V4.0 request should use.
+
+        Prefers the dedicated `vto_asset` and falls back to the merchandising
+        image, which is right for the demo catalogue where both are the same
+        original render.
+        """
+        if self.vto_asset is not None and self.vto_asset.is_tryon_capable:
+            return self.vto_asset
+        if self.image.is_tryon_capable:
+            return self.image
+        return None
+
+    @property
     def is_tryon_capable(self) -> bool:
         """Accessories are display-only; they never become a try-on reference."""
-        return self.slot != "accessory" and self.image.is_tryon_capable
+        return self.slot != "accessory" and self.tryon_reference is not None
+
+    @property
+    def tryon_uses_remote_image(self) -> bool:
+        """True when the only try-on reference is a remote URL we do not control.
+
+        A `file_id` (already in YouCam storage) or a `local_path` (a bundled asset
+        we upload ourselves) is one we can hand to the engine with confidence. A
+        plain `url` is a retailer's or CDN's image: the engine has to fetch it, and
+        we cannot yet guarantee it will accept it. The UI keeps try-on disabled for
+        those pieces rather than starting a job that fails at the vendor.
+        """
+        reference = self.tryon_reference
+        if reference is None:
+            return False
+        if reference.file_id or reference.local_path:
+            return False
+        return bool(reference.url)
 
     @property
     def is_demo(self) -> bool:
         """True when no real retailer listing backs this item."""
         return self.purchase_url is None
 
+    @property
+    def has_styled_shot(self) -> str | None:
+        """The URL of a worn shot of this garment, if the source published one."""
+        if self.styled_image is None:
+            return None
+        return self.styled_image.url or self.styled_image.file_id
+
+    @property
+    def can_shop(self) -> bool:
+        """True when there is a real page to send the shopper to.
+
+        The single gate on every "Shop" affordance in the UI. A demo product has
+        nothing to buy, and pretending otherwise with an invented URL is the one
+        thing that would make this app a lie.
+
+        Requires *both* fields. A provider that knows who sells an item but has no
+        verified URL for it must not produce a half-working shop button, so the
+        URL is the part that is genuinely load-bearing.
+        """
+        return bool(self.purchase_url) and bool(self.retailer)
+
     def matches_style(self, style: Style) -> bool:
         return style in self.styles
 
     def matches_occasion(self, occasion: Occasion) -> bool:
         return occasion in self.occasions
+
+    def matches_color(self, color: str | None) -> bool:
+        """Case-insensitive match against the pictured colour or any colourway."""
+        if not color:
+            return True
+        needle = color.strip().lower()
+        return any(needle in candidate.lower() for candidate in (self.color, *self.colors))
 
 
 @runtime_checkable
@@ -156,7 +293,7 @@ class ProductNotFoundError(LookupError):
     """Raised when a caller needs a product that the source cannot supply."""
 
 
-def require_reference(product: Product) -> ProductImage:
+def require_reference(product: Product) -> ProductImage | VtoAsset:
     """Return the garment image a V4.0 try-on needs, or fail loudly.
 
     Guarding here keeps the "no image means no request" rule in one place rather
@@ -168,9 +305,10 @@ def require_reference(product: Product) -> ProductImage:
             f"Product {product.product_id!r} is an accessory, which is display-only "
             "and cannot be sent to AI Clothes Virtual Try-On V4.0."
         )
-    if not product.image.is_tryon_capable:
+    reference = product.tryon_reference
+    if reference is None:
         raise ProductNotFoundError(
             f"Product {product.product_id!r} has no garment image, so it cannot "
             "be sent to AI Clothes Virtual Try-On V4.0."
         )
-    return product.image
+    return reference

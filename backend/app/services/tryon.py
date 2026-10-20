@@ -166,6 +166,21 @@ class TryOnJobStore:
         self._jobs.clear()
 
 
+@dataclass
+class TryOnReference:
+    """How the reference garment reaches YouCam.
+
+    Mirrors the three ways a catalogue can describe a garment and the three the
+    V4.0 task accepts: an image already in YouCam storage (`file_id`), one at a
+    publicly reachable `url` the vendor fetches itself, or bundled `image` bytes
+    we push through the File API first. Exactly one field is meaningfully set.
+    """
+
+    file_id: str | None = None
+    url: str | None = None
+    image: ValidatedImage | None = None
+
+
 class TryOnRunner:
     """Runs one try-on job to completion against the YouCam service."""
 
@@ -177,7 +192,7 @@ class TryOnRunner:
         job: TryOnJob,
         *,
         source: ValidatedImage,
-        reference: ValidatedImage,
+        reference: TryOnReference,
     ) -> TryOnJob:
         """Walk the documented flow, mutating `job` as it goes.
 
@@ -193,16 +208,28 @@ class TryOnRunner:
         )
 
         job.advance("uploading_reference_image")
-        reference_file = await self._service.upload_image(
-            reference.data,
-            file_name=build_file_name("reference", reference.content_type),
-            content_type=reference.content_type,
-        )
+        # The reference reaches the vendor by whichever transport the catalogue
+        # used: an id we already own, a public URL it can fetch, or bytes we push
+        # through the File API now.
+        reference_file_id = reference.file_id
+        reference_url = reference.url
+        if reference_file_id is None and reference_url is None:
+            if reference.image is None:
+                raise YouCamTaskError(
+                    "The reference garment has no image that can be sent to YouCam."
+                )
+            reference_file = await self._service.upload_image(
+                reference.image.data,
+                file_name=build_file_name("reference", reference.image.content_type),
+                content_type=reference.image.content_type,
+            )
+            reference_file_id = reference_file.file_id
 
         job.advance("submitting_task")
         task_id = await self._service.submit_try_on_garment(
             source_file_id=source_file.file_id,
-            reference_file_id=reference_file.file_id,
+            reference_file_id=reference_file_id,
+            reference_url=reference_url,
             garment_category=job.garment_category,
             filter_multi_person=job.filter_multi_person,
         )
@@ -223,7 +250,7 @@ async def execute_try_on_job(
     job: TryOnJob,
     *,
     source: ValidatedImage,
-    reference: ValidatedImage,
+    reference: TryOnReference,
     service: YouCamService | None = None,
 ) -> None:
     """Run `job` and record any failure on it instead of propagating it."""
@@ -258,7 +285,7 @@ def start_try_on_job(
     job: TryOnJob,
     *,
     source: ValidatedImage,
-    reference: ValidatedImage,
+    reference: TryOnReference,
     service: YouCamService | None = None,
 ) -> None:
     """Schedule the job and retain a strong reference to the task.

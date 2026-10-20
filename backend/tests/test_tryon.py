@@ -23,6 +23,7 @@ from app.services.tryon import (
     PHASE_SEQUENCE,
     TryOnJob,
     TryOnPhase,
+    TryOnReference,
     TryOnRunner,
     get_tryon_job_store,
     reset_tryon_jobs,
@@ -384,7 +385,9 @@ async def test_runner_reports_each_documented_phase_in_order() -> None:
     reference = validate_image(PNG_BYTES, label="garment", declared_content_type="image/png")
 
     try:
-        await TryOnRunner(service).run(job, source=source, reference=reference)
+        await TryOnRunner(service).run(
+            job, source=source, reference=TryOnReference(image=reference)
+        )
     finally:
         await service.client.aclose()
         store.clear()

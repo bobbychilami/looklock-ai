@@ -29,6 +29,7 @@ photograph of a real product.
 
 from __future__ import annotations
 
+import math
 import struct
 import sys
 import zlib
@@ -95,6 +96,13 @@ class Canvas:
         self.width = width
         self.height = height
         self.buffer = bytearray(width * height * 3)
+        #: 8-bit coverage, one byte per pixel. Only meaningful for a layer that
+        #: will be composited onto another canvas - the backdrop leaves it zero.
+        #: It exists so a garment can be rendered on its own and then dropped onto
+        #: the backdrop with a shadow derived from its actual silhouette, which is
+        #: the difference between a garment lying on a sweep and a garment pasted
+        #: onto one.
+        self.coverage = bytearray(width * height)
 
     # -- primitives -------------------------------------------------------- #
 
@@ -107,6 +115,10 @@ class Canvas:
         buffer[offset] = int(buffer[offset] * inverse + color[0] * alpha)
         buffer[offset + 1] = int(buffer[offset + 1] * inverse + color[1] * alpha)
         buffer[offset + 2] = int(buffer[offset + 2] * inverse + color[2] * alpha)
+        index = y * self.width + x
+        covered = int(alpha * 255)
+        if covered > self.coverage[index]:
+            self.coverage[index] = covered
 
     def span(
         self, y: float, x_start: float, x_end: float, color: Color, alpha: float = 1.0
@@ -136,6 +148,9 @@ class Canvas:
         offset = (row * self.width + interior_start) * 3
         if alpha >= 1.0:
             self.buffer[offset : offset + count * 3] = bytes(color) * count
+            self.coverage[
+                row * self.width + interior_start : row * self.width + interior_stop
+            ] = b"\xff" * count
         else:
             inverse = 1.0 - alpha
             buffer = self.buffer
@@ -166,6 +181,120 @@ class Canvas:
             crossings.sort()
             for pair in range(0, len(crossings) - 1, 2):
                 self.span(y, crossings[pair], crossings[pair + 1], color, alpha)
+
+    # -- shading ------------------------------------------------------------ #
+    #
+    # A flat fill reads as clip art; a garment reads as cloth because light falls
+    # unevenly across it. `shade` is sampled per scanline and per column band so a
+    # garment body gets a cylindrical highlight, darker roll-off at the seams, and
+    # a vertical falloff toward the hem. That is most of what separates a
+    # product-photograph impression from a vector icon.
+
+    #: Column bands per scanline when shading. Each band is written as a single
+    #: opaque `bytes * n` slice, so the cost stays in C; raising this trades file
+    #: size for smoothness.
+    SHADE_BANDS = 40
+
+    def _shade_color(self, base: Color, light: float) -> Color:
+        """Apply a `light` value in roughly [-0.35, +0.35] to `base`.
+
+        Positive light moves toward white, negative toward black, with a warm bias
+        on the lit side because the studio sweep is warm paper.
+        """
+        tint = (255, 252, 246) if light >= 0 else (24, 20, 18)
+        return blend(base, tint, min(0.45, abs(light)))
+
+    def shaded_polygon(
+        self,
+        points: Sequence[Point],
+        base: Color,
+        shade: Callable[[float, float, float, float], float] | None = None,
+        alpha: float = 1.0,
+    ) -> None:
+        """Fill a polygon with lighting derived from `shade`.
+
+        `shade` receives `(x, y, u, v)` - absolute pixel coordinates plus the
+        point's position within the polygon's own bounding box - and returns a
+        light value. Coordinates are absolute as well as relative so a caller can
+        line shading terms up across a garment body and its sleeves, which is what
+        stops each piece looking separately lit.
+        """
+        if len(points) < 3:
+            return
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        box_w = max(1.0, max_x - min_x)
+        box_h = max(1.0, max_y - min_y)
+
+        y_start = max(0, int(min_y))
+        y_stop = min(self.height, int(max_y) + 1)
+        count = len(points)
+        bands = self.SHADE_BANDS
+
+        for y in range(y_start, y_stop):
+            centre = y + 0.5
+            crossings: list[float] = []
+            for index in range(count):
+                x1, y1 = points[index]
+                x2, y2 = points[(index + 1) % count]
+                if (y1 <= centre < y2) or (y2 <= centre < y1):
+                    t = (centre - y1) / (y2 - y1)
+                    crossings.append(x1 + t * (x2 - x1))
+            crossings.sort()
+            for pair in range(0, len(crossings) - 1, 2):
+                left, right = crossings[pair], crossings[pair + 1]
+                if right <= left:
+                    continue
+                if shade is None:
+                    self.span(y, left, right, base, alpha)
+                    continue
+                span_w = right - left
+                for band in range(bands):
+                    near = left + span_w * band / bands
+                    far = left + span_w * (band + 1) / bands
+                    mid_x = (near + far) / 2
+                    self.span(
+                        y,
+                        near,
+                        far,
+                        self._shade_color(
+                            base,
+                            shade(
+                                mid_x,
+                                centre,
+                                (mid_x - min_x) / box_w,
+                                (centre - min_y) / box_h,
+                            ),
+                        ),
+                        alpha,
+                    )
+
+    def bloom(
+        self,
+        cx: float,
+        cy: float,
+        radius: float,
+        color: Color,
+        strength: float = 0.5,
+        steps: int = 18,
+    ) -> None:
+        """A soft radial falloff, painted as nested translucent ellipses.
+
+        Used for the sheen on silk and the bloom inside a highlight, where a hard
+        edge would read as a sticker rather than as light.
+        """
+        for index in range(steps):
+            t = index / max(steps - 1, 1)
+            self.ellipse(
+                cx,
+                cy,
+                radius * (0.25 + t * 0.85),
+                radius * (0.25 + t * 0.85) * 0.72,
+                color,
+                alpha=strength * (1.0 - t) ** 2,
+            )
 
     def rect(
         self, x: float, y: float, w: float, h: float, color: Color, alpha: float = 1.0
@@ -314,11 +443,218 @@ def paint_floor_shadow(canvas: Canvas, centre_x: float, base_y: float, width: fl
         )
 
 
+# --------------------------------------------------------------------------- #
+# Compositing: turning a drawn garment into something sitting on a sweep
+# --------------------------------------------------------------------------- #
+
+#: Resolution divisor for the shadow's mask. Blurring at 1/8 scale and scaling the
+#: result back up is what keeps a 1000x1250 drop shadow affordable in pure Python:
+#: a full-resolution separable blur would be tens of millions of operations per
+#: image, this is about twenty thousand.
+SHADOW_DOWNSCALE = 8
+
+#: Row segments used when painting the upscaled shadow. Adjacent segments with the
+#: same quantised alpha merge into one span, so the count stays in the tens per
+#: row rather than one per pixel.
+SHADOW_SEGMENTS = 96
+
+
+def _downsample_coverage(coverage: bytearray, width: int, height: int) -> tuple[
+    list[float], int, int
+]:
+    """Average coverage into a coarse grid.
+
+    Uses `bytes.count` and per-chunk `sum` rather than a per-pixel Python loop:
+    at full resolution that loop is 1.25 million iterations per image, which
+    dominates the generator's runtime for no benefit.
+    """
+    factor = SHADOW_DOWNSCALE
+    small_w = (width + factor - 1) // factor
+    small_h = (height + factor - 1) // factor
+    totals = [0.0] * (small_w * small_h)
+    samples = [0] * (small_w * small_h)
+
+    for y in range(height):
+        row = bytes(coverage[y * width : (y + 1) * width])
+        if row.count(0) == width:
+            continue
+        small_y = y // factor
+        rows_in_band = min(factor, height - small_y * factor)
+        base = small_y * small_w
+        for sx in range(small_w):
+            chunk = row[sx * factor : (sx + 1) * factor]
+            if not chunk:
+                continue
+            value = sum(chunk)
+            if value:
+                cell = base + sx
+                totals[cell] += value / 255.0
+                samples[cell] += len(chunk) * rows_in_band
+
+    grid = [
+        totals[cell] / samples[cell] if samples[cell] else 0.0
+        for cell in range(len(totals))
+    ]
+    return (grid, small_w, small_h)
+
+
+def _blur_grid(grid: list[float], w: int, h: int, radius: int, passes: int = 2) -> list[float]:
+    """Two-pass box blur on a small float grid. Separable, so O(w + h) per pass."""
+    out = list(grid)
+    for _ in range(passes):
+        # Horizontal.
+        for y in range(h):
+            base = y * w
+            previous = out[base]
+            current = out[base]
+            for x in range(1, w):
+                acc = current + previous
+                current = out[base + x]
+                out[base + x] = acc / 2
+                previous = current
+        # Vertical.
+        for x in range(w):
+            previous = out[x]
+            for y in range(1, h):
+                acc = out[(y * w) + x]
+                out[(y * w) + x] = (acc + previous) / 2
+                previous = acc
+    return out
+
+
+def _sample_grid(grid: list[float], w: int, h: int, x: float, y: float) -> float:
+    """Bilinear sample, clamped at the edges."""
+    fx = min(max(x, 0.0), w - 1.001)
+    fy = min(max(y, 0.0), h - 1.001)
+    x0, y0 = int(fx), int(fy)
+    tx, ty = fx - x0, fy - y0
+    a = grid[(y0 * w) + x0]
+    b = grid[(y0 * w) + x0 + 1]
+    c = grid[((y0 + 1) * w) + x0]
+    d = grid[((y0 + 1) * w) + x0 + 1]
+    top = a + (b - a) * tx
+    bottom = c + (d - c) * tx
+    return top + (bottom - top) * ty
+
+
+def paint_drop_shadow(
+    canvas: Canvas,
+    layer: Canvas,
+    *,
+    offset_x: float,
+    offset_y: float,
+    blur: float = 18.0,
+    strength: float = 0.34,
+) -> None:
+    """Soft cast shadow from a garment's own silhouette.
+
+    Without this the garment floats: it has no occlusion against the sweep and no
+    contact, which is the single most obvious tell between a rendered product
+    shot and a flat illustration. The light is upper-left, so the shadow falls
+    down and to the right.
+    """
+    grid, small_w, small_h = _downsample_coverage(layer.coverage, layer.width, layer.height)
+    if not any(grid):
+        return
+    grid = _blur_grid(grid, small_w, small_h, max(1, int(blur / SHADOW_DOWNSCALE)))
+
+    scale = 1.0 / SHADOW_DOWNSCALE
+    shadow = blend(PAPER_BOTTOM, FLOOR, 0.55)
+
+    for row in range(canvas.height):
+        y = (row - offset_y) * scale
+        if y < -1 or y > small_h + 1:
+            continue
+        segments = SHADOW_SEGMENTS
+        step = canvas.width / segments
+        run_start = None
+        run_alpha = 0.0
+        for index in range(segments + 1):
+            x_pixel = index * step
+            if index == segments:
+                alpha = 0.0
+            else:
+                sample = _sample_grid(
+                    grid, small_w, small_h, (x_pixel - offset_x) * scale, y
+                )
+                # Squaring deepens the core while keeping the fringe faint, which
+                # is how an out-of-focus shadow actually behaves.
+                alpha = min(1.0, sample * sample * 3.2) * strength
+                alpha = round(alpha * 24) / 24
+            if alpha != run_alpha:
+                if run_alpha > 0 and run_start is not None:
+                    canvas.span(row, run_start, x_pixel, shadow, run_alpha)
+                run_start = x_pixel if alpha > 0 else None
+                run_alpha = alpha
+
+
+def composite(canvas: Canvas, layer: Canvas) -> None:
+    """Draw `layer` onto `canvas` using its coverage as the alpha channel.
+
+    Interior runs are fully opaque and contiguous, so they are located with
+    `bytes.find` and copied as slices. Only the antialiased boundary pixels need
+    per-pixel blending, which is what keeps this affordable: a naive per-pixel
+    loop here would be the single most expensive thing in the generator.
+    """
+    width, height = layer.width, layer.height
+    coverage, source = layer.coverage, layer.buffer
+
+    for y in range(height):
+        row_base = y * width
+        cov_row = bytes(coverage[row_base : row_base + width])
+        if cov_row.count(0) == width:
+            continue
+
+        target_row = y * canvas.width
+        x = 0
+        while x < width:
+            # Partial pixels before the next fully opaque run.
+            while x < width and cov_row[x] != 255:
+                alpha = cov_row[x]
+                if alpha:
+                    at = (row_base + x) * 3
+                    canvas._blend_pixel(
+                        y,
+                        x,
+                        (source[at], source[at + 1], source[at + 2]),
+                        alpha / 255,
+                    )
+                x += 1
+            if x >= width:
+                break
+
+            start = x
+            end = start
+            while end < width and cov_row[end] == 255:
+                end += 1
+
+            at = (row_base + start) * 3
+            to = (target_row + start) * 3
+            canvas.buffer[to : to + (end - start) * 3] = source[at : at + (end - start) * 3]
+            x = end
+
+
 def garment_scene(draw: Callable[[Canvas], None], *, base_y: float = 1046) -> Canvas:
+    """Backdrop, contact shadow, cast shadow, then the garment itself.
+
+    The garment is rendered onto its own layer first so the cast shadow can be
+    derived from its real silhouette instead of being guessed as an ellipse.
+    """
     canvas = Canvas(CANVAS_W, CANVAS_H)
     paint_backdrop(canvas)
-    draw(canvas)
+
+    layer = Canvas(CANVAS_W, CANVAS_H)
+    draw(layer)
     paint_floor_shadow(canvas, CANVAS_W / 2, base_y, 250)
+    paint_drop_shadow(
+        canvas,
+        layer,
+        offset_x=26,
+        offset_y=18,
+        blur=22,
+        strength=0.30 if base_y < 900 else 0.36,
+    )
+    composite(canvas, layer)
     return canvas
 
 
@@ -327,6 +663,106 @@ def garment_scene(draw: Callable[[Canvas], None], *, base_y: float = 1046) -> Ca
 # --------------------------------------------------------------------------- #
 
 CX = CANVAS_W / 2
+
+
+# --------------------------------------------------------------------------- #
+# Shading functions.
+#
+# These are the terms that make a flat silhouette read as cloth. They take
+# absolute canvas coordinates so a body and its sleeves can be lit by the same
+# key light, and they compose by addition.
+# --------------------------------------------------------------------------- #
+
+#: Where the studio key light sits, and how tight it is.
+KEY_X, KEY_Y = CANVAS_W * 0.38, CANVAS_H * 0.30
+KEY_FALLOFF = 620.0
+
+
+def key_light(x: float, y: float, strength: float = 0.22) -> float:
+    """A broad highlight around the key light, decaying with distance."""
+    dx = (x - KEY_X) / KEY_FALLOFF
+    dy = (y - KEY_Y) / (KEY_FALLOFF * 1.15)
+    return strength * (1.0 / (1.0 + (dx * dx + dy * dy) * 5.0))
+
+
+def cylinder(u: float, strength: float = 0.20, centre: float = 0.42) -> float:
+    """Round shading across a garment's width.
+
+    `u` is 0..1 across the body. Returns a positive value on the lit side of the
+    form and a negative one as it rolls away, which is what gives a flat
+    silhouette a cylindrical body.
+    """
+    if not 0.0 <= u <= 1.0:
+        return 0.0
+    offset = (u - centre) * 2.0
+    return strength * (offset * -1.0) * max(0.0, 1.0 - offset * offset) * 1.6 - 0.06
+
+
+def drape_falloff(v: float, strength: float = 0.12) -> float:
+    """Cloth loses light as it hangs away from the shoulders."""
+    if not 0.0 <= v <= 1.0:
+        return 0.0
+    return -strength * (v**1.7)
+
+
+def hem_bounce(v: float, strength: float = 0.07) -> float:
+    """A little light kicks back up into the hem from the floor."""
+    if not 0.0 <= v <= 1.0:
+        return 0.0
+    return strength * max(0.0, v - 0.72) / 0.28
+
+
+def fold_field(x: float, *, folds: Sequence[tuple[float, float, float]], gain: float = 0.10):
+    """A cloth-fold term built from soft vertical ridges.
+
+    Each fold is `(centre_x, half_width, depth)`. A garment photographed on a
+    hanger is a series of soft vertical ridges and troughs; without them the
+    shading reads as a smooth plastic shell.
+    """
+    terms = [0.0]
+    for centre, width, depth in folds:
+        d = abs(x - centre) / width
+        if d < 1.0:
+            # A ridge: lit on the lit side, shadowed in the trough just off-centre.
+            terms.append(-depth * gain * math.sin(d * math.pi) * math.cos(d * math.pi * 1.5))
+    return sum(terms)
+
+
+def fabric_grain(x: float, y: float, base: Color, strength: float = 0.028) -> Color:
+    """A deterministic per-pixel tint variation standing in for weave texture.
+
+    Cheap and invisible individually; the point is that the large areas stop
+    looking like a single flat fill. Uses a hash of the coordinates rather than
+    `random` so the output is byte-for-byte reproducible.
+    """
+    h = (x * 73856093) ^ (y * 19349663)
+    h = (h * 2246822519) & 0xFFFFFFFF
+    signed = ((h >> 8) & 0xFF) / 255.0 - 0.5
+    amount = signed * strength * 2
+    tint = (255, 252, 246) if amount >= 0 else (20, 18, 16)
+    return blend(base, tint, min(0.12, abs(amount)))
+
+
+def body_shade(
+    *,
+    folds: Sequence[tuple[float, float, float]] = (),
+    key: float = 0.22,
+    cylinder_strength: float = 0.20,
+    fall: float = 0.12,
+    bounce: float = 0.07,
+):
+    """Bundle the standard garment shading terms into one callable for `shade`."""
+
+    def shade(x: float, y: float, u: float, v: float) -> float:
+        return (
+            key_light(x, y, key)
+            + cylinder(u, cylinder_strength)
+            + drape_falloff(v, fall)
+            + hem_bounce(v, bounce)
+            + fold_field(x, folds=folds)
+        )
+
+    return shade
 
 
 def draw_tunic(
@@ -339,6 +775,7 @@ def draw_tunic(
     placket: bool = True,
     accent: Color = CHAMPAGNE,
     buttons: int = 0,
+    sheen: bool = False,
 ) -> Callable[[Canvas], None]:
     """Long front-opening garment: sherwani, kurta, coat, blazer body."""
 
@@ -353,19 +790,56 @@ def draw_tunic(
             (CX + waist, top + 210),
             (CX + shoulder, top + 34),
         ]
-        canvas.polygon(body, cloth)
+        # Folds sit between the placket and the side seams, where cloth actually
+        # gathers on a garment hung flat.
+        folds = (
+            (CX - shoulder * 0.52, 66, 0.9),
+            (CX + shoulder * 0.30, 58, 0.7),
+            (CX + shoulder * 0.74, 44, 0.5),
+        )
+        shade = body_shade(folds=folds, cylinder_strength=0.24, fall=0.16)
+        canvas.shaded_polygon(body, cloth, shade)
 
         # Sleeves.
         for side in (-1, 1):
             inner_x = CX + side * shoulder
-            canvas.polygon(
-                [
-                    (inner_x, top + 36),
-                    (inner_x + side * 132, top + 96),
-                    (inner_x + side * 118, top + 300),
-                    (inner_x - side * 16, top + 250),
-                ],
+            sleeve = [
+                (inner_x, top + 36),
+                (inner_x + side * 132, top + 96),
+                (inner_x + side * 118, top + 300),
+                (inner_x - side * 16, top + 250),
+            ]
+            canvas.shaded_polygon(
+                sleeve,
                 cloth,
+                body_shade(
+                    folds=((inner_x + side * 70, 40, 0.6),),
+                    key=0.20,
+                    cylinder_strength=0.16,
+                    fall=0.10,
+                ),
+            )
+            # Cuff, in the accent cloth as a real garment would be.
+            canvas.shaded_polygon(
+                [
+                    (inner_x + side * 118, top + 296),
+                    (inner_x + side * 130, top + 300),
+                    (inner_x + side * 116, top + 348),
+                    (inner_x + side * 104, top + 344),
+                ],
+                _darken(cloth, 0.06),
+                body_shade(key=0.16, cylinder_strength=0.1, fall=0.0),
+            )
+
+        if sheen:
+            # Silk catches a broad soft highlight down the lit side of the body.
+            canvas.bloom(
+                CX - waist * 0.34,
+                top + (hem_y - top) * 0.30,
+                210,
+                GLOW,
+                strength=0.20,
+                steps=16,
             )
 
         # Shoulder seams and a soft hem band give the flat some structure.
@@ -373,12 +847,13 @@ def draw_tunic(
         canvas.rect(CX - waist - 26, hem_y - 16, (waist + 26) * 2, 8, accent, 0.35)
 
         if collar == "v":
-            canvas.polygon(
+            canvas.shaded_polygon(
                 [(CX - neck, top + 18), (CX, top + 150), (CX + neck, top + 18)],
                 _darken(cloth, 0.12),
+                body_shade(key=0.14, cylinder_strength=0.1, fall=0.0),
             )
         elif collar == "shawl":
-            canvas.polygon(
+            canvas.shaded_polygon(
                 [
                     (CX - neck - 34, top + 22),
                     (CX - 6, top + 250),
@@ -388,6 +863,7 @@ def draw_tunic(
                     (CX - 10, top + 10),
                 ],
                 _darken(cloth, 0.1),
+                body_shade(key=0.16, cylinder_strength=0.12, fall=0.06),
             )
         else:  # "band"
             canvas.rect(CX - neck - 26, top + 12, (neck + 26) * 2, 46, _darken(cloth, 0.12))
@@ -396,17 +872,220 @@ def draw_tunic(
             canvas.rect(CX - 4, top + 20, 8, hem_y - top - 30, _darken(cloth, 0.08), 0.9)
         for index in range(buttons):
             canvas.ellipse(CX, top + 180 + index * 96, 11, 11, accent)
+            canvas.ellipse(CX - 3, top + 177 + index * 96, 4, 4, blend(accent, GLOW, 0.5))
+
+    return paint
+
+
+def draw_bandhgala_jacket(
+    cloth: Color, *, accent: Color = CHAMPAGNE, length: float = 660
+) -> Callable[[Canvas], None]:
+    """A long, open-front ethnic outer layer - the bandhgala jacket.
+
+    Drawn as an open garment: two front panels parted around a gap, which is what
+    distinguishes a jacket from the bandhgala shirt it is worn over. That gap is
+    also what makes it read as outerwear rather than as a fifth top.
+    """
+
+    def paint(canvas: Canvas) -> None:
+        top = 300
+        hem = top + length
+        shoulder, flare = 236, 74
+        shade = body_shade(
+            folds=((CX - 150, 60, 0.9), (CX + 150, 60, 0.9), (CX - 214, 40, 0.5)),
+            cylinder_strength=0.22,
+            fall=0.18,
+        )
+        canvas.shaded_polygon(
+            [
+                (CX - shoulder, top + 40),
+                (CX - flare, hem),
+                (CX - 40, hem),
+                (CX - 52, top + 30),
+            ],
+            cloth,
+            shade,
+        )
+        canvas.shaded_polygon(
+            [
+                (CX + shoulder, top + 40),
+                (CX + flare, hem),
+                (CX + 40, hem),
+                (CX + 52, top + 30),
+            ],
+            cloth,
+            shade,
+        )
+
+        for side in (-1, 1):
+            inner_x = CX + side * shoulder
+            canvas.shaded_polygon(
+                [
+                    (inner_x, top + 42),
+                    (inner_x + side * 128, top + 108),
+                    (inner_x + side * 112, top + 330),
+                    (inner_x - side * 20, top + 272),
+                ],
+                cloth,
+                body_shade(
+                    folds=((inner_x + side * 66, 38, 0.55),),
+                    key=0.20,
+                    cylinder_strength=0.15,
+                    fall=0.10,
+                ),
+            )
+
+        # Standing collar, and the brocade border down each front edge.
+        canvas.shaded_polygon(
+            [
+                (CX - 84, top + 34),
+                (CX + 84, top + 34),
+                (CX + 74, top - 46),
+                (CX - 74, top - 46),
+            ],
+            _darken(cloth, 0.1),
+            body_shade(key=0.18, cylinder_strength=0.14, fall=0.0),
+        )
+        for side in (-1, 1):
+            canvas.polygon(
+                [
+                    (CX + side * 40, hem - 10),
+                    (CX + side * 56, hem - 10),
+                    (CX + side * 50, top + 30),
+                    (CX + side * 38, top + 30),
+                ],
+                accent,
+                0.55,
+            )
+        # Hem band.
+        canvas.rect(CX - flare - 12, hem - 14, (flare + 12) * 2, 10, accent, 0.4)
+        canvas.bloom(CX - 120, top + 240, 190, GLOW, strength=0.16, steps=14)
+
+    return paint
+
+
+def draw_coat(
+    cloth: Color,
+    *,
+    accent: Color = CHAMPAGNE,
+    length: float = 720,
+    lapel: float = 54,
+    buttons: int = 2,
+    patch_pockets: bool = False,
+) -> Callable[[Canvas], None]:
+    """A long tailored outer: overcoat, safari jacket, trucker.
+
+    One drawer covers all three because they differ in cut details rather than in
+    silhouette logic, and separate drawers for the same shading would only invite
+    the three to drift apart.
+    """
+
+    def paint(canvas: Canvas) -> None:
+        top = 300
+        hem = top + length
+        shoulder, waist, flare = 228, 196, 236
+        shade = body_shade(
+            folds=((CX - 140, 62, 0.85), (CX + 120, 56, 0.75), (CX + 206, 40, 0.45)),
+            cylinder_strength=0.23,
+            fall=0.15,
+        )
+        body = [
+            (CX - shoulder, top + 36),
+            (CX - waist, top + 250),
+            (CX - flare, hem),
+            (CX + flare, hem),
+            (CX + waist, top + 250),
+            (CX + shoulder, top + 36),
+        ]
+        canvas.shaded_polygon(body, cloth, shade)
+
+        for side in (-1, 1):
+            inner_x = CX + side * shoulder
+            canvas.shaded_polygon(
+                [
+                    (inner_x, top + 38),
+                    (inner_x + side * 136, top + 104),
+                    (inner_x + side * 118, top + 322),
+                    (inner_x - side * 18, top + 268),
+                ],
+                cloth,
+                body_shade(
+                    folds=((inner_x + side * 70, 40, 0.6),),
+                    key=0.20,
+                    cylinder_strength=0.16,
+                    fall=0.10,
+                ),
+            )
+
+        # Notch lapel.
+        for side in (-1, 1):
+            canvas.shaded_polygon(
+                [
+                    (CX + side * 10, top + 210),
+                    (CX + side * lapel, top + 176),
+                    (CX + side * (shoulder - 18), top + 40),
+                    (CX + side * 16, top + 46),
+                ],
+                _darken(cloth, 0.09),
+                body_shade(key=0.18, cylinder_strength=0.12, fall=0.0),
+            )
+
+        if patch_pockets:
+            for side in (-1, 1):
+                canvas.shaded_polygon(
+                    [
+                        (CX + side * 56, hem - 210),
+                        (CX + side * 168, hem - 210),
+                        (CX + side * 168, hem - 84),
+                        (CX + side * 56, hem - 84),
+                    ],
+                    _darken(cloth, 0.05),
+                    body_shade(key=0.14, cylinder_strength=0.1, fall=0.0),
+                )
+                canvas.rect(
+                    CX + side * 56 - (112 if side > 0 else 0),
+                    hem - 210,
+                    112,
+                    6,
+                    _darken(cloth, 0.16),
+                    0.6,
+                )
+
+        for index in range(buttons):
+            canvas.ellipse(CX + lapel * 0.4, top + 300 + index * 92, 12, 12, accent)
+            canvas.ellipse(
+                CX + lapel * 0.4 - 3, top + 297 + index * 92, 4, 4, blend(accent, GLOW, 0.5)
+            )
+
+        # Welt seams along the side seams give the coat a tailored read.
+        for side in (-1, 1):
+            canvas.line(
+                CX + side * (waist + 6),
+                top + 250,
+                CX + side * (flare - 10),
+                hem - 20,
+                5,
+                _darken(cloth, 0.13),
+                0.5,
+            )
 
     return paint
 
 
 def draw_shirt(
-    cloth: Color, *, accent: Color = IVORY, buttons: int = 4
+    cloth: Color, *, accent: Color = IVORY, buttons: int = 4, collar: str = "v"
 ) -> Callable[[Canvas], None]:
+    """A collared shirt, short- or band-collared."""
+
     def paint(canvas: Canvas) -> None:
         top, hem = 300, 830
         shoulder, waist = 200, 178
-        canvas.polygon(
+        shade = body_shade(
+            folds=((CX - 96, 54, 0.8), (CX + 84, 48, 0.7), (CX + 170, 36, 0.4)),
+            cylinder_strength=0.22,
+            fall=0.13,
+        )
+        canvas.shaded_polygon(
             [
                 (CX - shoulder, top + 30),
                 (CX - waist, top + 150),
@@ -416,10 +1095,11 @@ def draw_shirt(
                 (CX + shoulder, top + 30),
             ],
             cloth,
+            shade,
         )
         for side in (-1, 1):
             inner_x = CX + side * shoulder
-            canvas.polygon(
+            canvas.shaded_polygon(
                 [
                     (inner_x, top + 32),
                     (inner_x + side * 128, top + 86),
@@ -427,43 +1107,130 @@ def draw_shirt(
                     (inner_x - side * 20, top + 200),
                 ],
                 cloth,
+                body_shade(
+                    folds=((inner_x + side * 64, 36, 0.55),),
+                    key=0.20,
+                    cylinder_strength=0.15,
+                    fall=0.09,
+                ),
             )
-        canvas.polygon(
-            [(CX - 52, top + 14), (CX, top + 122), (CX + 52, top + 14)], _darken(cloth, 0.1)
-        )
+
+        if collar == "mandarin":
+            canvas.shaded_polygon(
+                [
+                    (CX - 58, top + 44),
+                    (CX + 58, top + 44),
+                    (CX + 50, top - 30),
+                    (CX - 50, top - 30),
+                ],
+                _darken(cloth, 0.1),
+                body_shade(key=0.16, cylinder_strength=0.13, fall=0.0),
+            )
+        else:
+            canvas.shaded_polygon(
+                [(CX - 52, top + 14), (CX, top + 122), (CX + 52, top + 14)],
+                _darken(cloth, 0.1),
+                body_shade(key=0.15, cylinder_strength=0.12, fall=0.0),
+            )
+            for side in (-1, 1):
+                canvas.shaded_polygon(
+                    [
+                        (CX + side * 44, top + 16),
+                        (CX + side * 92, top + 22),
+                        (CX + side * 40, top + 116),
+                    ],
+                    _darken(cloth, 0.14),
+                    body_shade(key=0.14, cylinder_strength=0.1, fall=0.0),
+                )
+
         canvas.rect(CX - 3, top + 24, 6, hem - top - 40, _darken(cloth, 0.08), 0.9)
         for index in range(buttons):
             canvas.ellipse(CX, top + 160 + index * 96, 9, 9, accent)
+            canvas.ellipse(CX - 2, top + 158 + index * 96, 3, 3, blend(accent, GLOW, 0.5))
         canvas.rect(CX - waist, hem - 12, waist * 2, 6, accent, 0.4)
 
     return paint
 
 
 def draw_trousers(
-    cloth: Color, *, accent: Color = CHAMPAGNE, taper: float = 0.62
+    cloth: Color, *, accent: Color = CHAMPAGNE, taper: float = 0.62, drawstring: bool = False
 ) -> Callable[[Canvas], None]:
     def paint(canvas: Canvas) -> None:
         top, hem = 300, 1010
         hip, thigh, knee = 168, 132, 118
         ankle = round(knee + (knee - thigh) * taper)
         canvas.rect(CX - hip, top, hip * 2, 74, cloth)
+        # Waistband is shaded like the rest of the garment so it does not read as
+        # a flat strip laid over the top of the legs.
+        canvas.shaded_polygon(
+            [(CX - hip, top), (CX + hip, top), (CX + hip, top + 74), (CX - hip, top + 74)],
+            cloth,
+            body_shade(key=0.16, cylinder_strength=0.2, fall=0.0),
+        )
         canvas.rect(CX - hip, top, hip * 2, 16, _darken(cloth, 0.12))
+
         for side in (-1, 1):
-            canvas.polygon(
-                [
-                    (CX + side * hip, top + 30),
-                    (CX + side * thigh, top + 200),
-                    (CX + side * knee, top + 520),
-                    (CX + side * ankle, hem),
-                    (CX + side * (ankle - 46), hem),
-                    (CX + side * (knee - 44), top + 520),
-                    (CX + side * (thigh - 40), top + 200),
-                    (CX + side * (hip - 4), top + 30),
-                ],
+            leg = [
+                (CX + side * hip, top + 30),
+                (CX + side * thigh, top + 200),
+                (CX + side * knee, top + 520),
+                (CX + side * ankle, hem),
+                (CX + side * (ankle - 46), hem),
+                (CX + side * (knee - 44), top + 520),
+                (CX + side * (thigh - 40), top + 200),
+                (CX + side * (hip - 4), top + 30),
+            ]
+            canvas.shaded_polygon(
+                leg,
                 cloth,
+                body_shade(
+                    folds=(
+                        (CX + side * (thigh - 26), 34, 0.7),
+                        (CX + side * (knee - 20), 28, 0.5),
+                    ),
+                    key=0.20,
+                    cylinder_strength=0.20,
+                    fall=0.12,
+                ),
             )
+            # Hem turned up, catching a little light along the fold.
+            canvas.rect(
+                CX + side * (ankle - 46),
+                hem - 34,
+                46,
+                8,
+                _darken(cloth, 0.12),
+                0.7,
+            )
+
+        # Crease down each leg.
+        for side in (-1, 1):
+            canvas.line(
+                CX + side * (knee - 16),
+                top + 240,
+                CX + side * (ankle - 26),
+                hem - 40,
+                6,
+                _darken(cloth, 0.15),
+                0.55,
+            )
+
         canvas.rect(CX - thigh - 8, top + 210, (thigh + 8) * 2, 5, _darken(cloth, 0.14), 0.7)
-        canvas.ellipse(CX, top + 44, 13, 13, accent)
+
+        if drawstring:
+            # Elasticated back waist plus the cord, which is how this trouser is
+            # actually worn and what stops it reading as a formal trouser.
+            for index in range(9):
+                y = top + 8 + index * 8
+                canvas.rect(CX - hip + 6, y, (hip - 6) * 2, 4, _darken(cloth, 0.1), 0.5)
+            canvas.ellipse(CX, top + 40, 13, 13, accent)
+            canvas.ellipse(CX, top + 40, 6, 6, _darken(cloth, 0.2))
+            for side in (-1, 1):
+                canvas.line(
+                    CX, top + 44, CX + side * 62, top + 96, 5, accent, 0.85
+                )
+        else:
+            canvas.ellipse(CX, top + 44, 13, 13, accent)
 
     return paint
 
@@ -472,23 +1239,41 @@ def draw_churidar(cloth: Color, *, accent: Color = CHAMPAGNE) -> Callable[[Canva
     def paint(canvas: Canvas) -> None:
         top, hem = 300, 1010
         hip, thigh, ankle = 162, 112, 62
-        canvas.rect(CX - hip, top, hip * 2, 68, cloth)
+        canvas.shaded_polygon(
+            [(CX - hip, top), (CX + hip, top), (CX + hip, top + 68), (CX - hip, top + 68)],
+            cloth,
+            body_shade(key=0.16, cylinder_strength=0.2, fall=0.0),
+        )
         canvas.rect(CX - hip, top, hip * 2, 14, _darken(cloth, 0.12))
         for side in (-1, 1):
-            canvas.polygon(
-                [
-                    (CX + side * (hip - 14), top + 20),
-                    (CX + side * hip, top + 20),
-                    (CX + side * (thigh + 30), top + 340),
-                    (CX + side * ankle, hem),
-                    (CX + side * (ankle - 18), hem),
-                    (CX + side * (thigh - 16), top + 330),
-                ],
+            leg = [
+                (CX + side * (hip - 14), top + 20),
+                (CX + side * hip, top + 20),
+                (CX + side * (thigh + 30), top + 340),
+                (CX + side * ankle, hem),
+                (CX + side * (ankle - 18), hem),
+                (CX + side * (thigh - 16), top + 330),
+            ]
+            canvas.shaded_polygon(
+                leg,
                 cloth,
+                body_shade(
+                    # The gathers at the knee are the whole character of a churidar,
+                    # so they get a much stronger fold field than a flat trouser.
+                    folds=(
+                        (CX + side * (thigh - 4), 26, 1.4),
+                        (CX + side * 96, 24, 0.9),
+                    ),
+                    key=0.20,
+                    cylinder_strength=0.20,
+                    fall=0.12,
+                ),
             )
+        # Gathered folds across the knee.
         for index in range(7):
             y = top + 250 + index * 96
-            canvas.rect(CX - 60, y, 120, 6, _darken(cloth, 0.1), 0.55)
+            span = 60 + index * 9
+            canvas.rect(CX - span, y, span * 2, 6, _darken(cloth, 0.1), 0.5)
         canvas.ellipse(CX, top + 40, 12, 12, accent)
 
     return paint
@@ -501,14 +1286,36 @@ def draw_skirt(
         top = 340
         hem = top + length
         waist, wide = 128, 292
-        canvas.polygon(
-            [(CX - waist, top), (CX + waist, top), (CX + wide, hem), (CX - wide, hem)], cloth
+        canvas.shaded_polygon(
+            [(CX - waist, top), (CX + waist, top), (CX + wide, hem), (CX - wide, hem)],
+            cloth,
+            # A skirt flares, so it gathers toward the waist: folds fan outward.
+            body_shade(
+                folds=(
+                    (CX - 200, 54, 1.0),
+                    (CX - 70, 46, 0.8),
+                    (CX + 70, 46, 0.8),
+                    (CX + 200, 54, 1.0),
+                ),
+                cylinder_strength=0.18,
+                fall=0.12,
+            ),
         )
         canvas.rect(CX - waist, top, waist * 2, 42, _darken(cloth, 0.1))
         canvas.rect(CX - wide, hem - 12, wide * 2, 8, accent, 0.4)
+        # Vertical pleats following the flare.
         for index in range(5):
-            x = CX - 210 + index * 105
-            canvas.line(x, top + 60, CX + (x - CX) * 1.5, hem - 20, 4, _darken(cloth, 0.08), 0.5)
+            spread = 1.5
+            x_top = CX - 100 + index * 50
+            canvas.line(
+                x_top,
+                top + 60,
+                CX + (x_top - CX) * spread,
+                hem - 20,
+                4,
+                _darken(cloth, 0.08),
+                0.45,
+            )
 
     return paint
 
@@ -683,18 +1490,27 @@ def _darken(color: Color, amount: float) -> Color:
 Asset = tuple[str, Callable[[], Callable[[Canvas], None]], float]
 
 ASSETS: tuple[Asset, ...] = (
-    # -- upper / outer (10) -- #
-    ("ivory-sherwani.png", draw_tunic(IVORY, collar="v", buttons=3, accent=CHAMPAGNE), 1046),
+    # -- upper (11) -- #
+    (
+        "ivory-sherwani.png",
+        draw_tunic(IVORY, collar="v", buttons=3, accent=CHAMPAGNE, sheen=True),
+        1046,
+    ),
     ("ivory-bandhgala.png", draw_tunic(IVORY, collar="band", hem_y=980, accent=CHAMPAGNE), 1026),
     ("cream-kurta.png", draw_tunic(CREAM, collar="v", hem_y=930, accent=SAFFRON), 976),
-    ("rust-sherwani.png", draw_tunic(RUST, collar="v", buttons=3, accent=CHAMPAGNE), 1046),
+    (
+        "rust-sherwani.png",
+        draw_tunic(RUST, collar="v", buttons=3, accent=CHAMPAGNE, sheen=True),
+        1046,
+    ),
     ("indigo-blazer.png", draw_tunic(INDIGO, collar="shawl", hem_y=870, accent=MIST), 916),
     ("charcoal-blazer.png", draw_tunic(CHARCOAL, collar="shawl", hem_y=880, accent=MIST), 926),
     ("teal-jacket.png", draw_tunic(DEEP_TEAL, collar="shawl", hem_y=860, accent=CHAMPAGNE), 906),
     ("ivory-shirt.png", draw_shirt(IVORY, accent=CREAM, buttons=4), 876),
     ("mist-shirt.png", draw_shirt(MIST, accent=IVORY, buttons=4), 876),
     ("plum-shirt.png", draw_shirt(PLUM, accent=CHAMPAGNE, buttons=4), 876),
-    # -- lower (8) -- #
+    ("cream-mandarin.png", draw_shirt(CREAM, accent=IVORY, buttons=3, collar="mandarin"), 876),
+    # -- lower (9) -- #
     ("ivory-churidar.png", draw_churidar(IVORY, accent=CHAMPAGNE), 1010),
     ("cream-churidar.png", draw_churidar(CREAM, accent=SAFFRON), 1010),
     ("ink-trousers.png", draw_trousers(INK_BLACK, accent=CHAMPAGNE), 1010),
@@ -703,6 +1519,25 @@ ASSETS: tuple[Asset, ...] = (
     ("teal-trousers.png", draw_trousers(DEEP_TEAL, accent=CHAMPAGNE), 1010),
     ("charcoal-skirt.png", draw_skirt(CHARCOAL, accent=MIST, length=470), 856),
     ("mist-skirt.png", draw_skirt(MIST, accent=IVORY, length=430), 816),
+    (
+        "cream-drawstring.png",
+        draw_trousers(CREAM, accent=SAFFRON, taper=0.5, drawstring=True),
+        1010,
+    ),
+    # -- outerwear (5) -- #
+    ("ivory-bandhgala-jacket.png", draw_bandhgala_jacket(IVORY, accent=CHAMPAGNE), 1000),
+    ("rust-brocade-jacket.png", draw_bandhgala_jacket(RUST, accent=SAFFRON), 1000),
+    ("charcoal-wool-coat.png", draw_coat(CHARCOAL, accent=MIST, length=760, lapel=62), 1100),
+    (
+        "cream-linen-jacket.png",
+        draw_coat(CREAM, accent=OLIVE, length=640, lapel=48, patch_pockets=True),
+        980,
+    ),
+    (
+        "indigo-denim-jacket.png",
+        draw_coat(INDIGO, accent=MIST, length=600, lapel=52, buttons=3),
+        940,
+    ),
     # -- footwear (5) -- #
     ("gold-mojari.png", draw_mojari(CHAMPAGNE, accent=SAFFRON, sole=CREAM), 964),
     ("cream-mojari.png", draw_mojari(CREAM, accent=SAFFRON, sole=IVORY), 964),

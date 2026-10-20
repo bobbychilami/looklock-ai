@@ -30,11 +30,12 @@ from pydantic import BaseModel
 from app.api.deps import youcam_service_dependency
 from app.api.routes.tryon import RESULT_URL_TTL_HOURS
 from app.catalog import Product, ProductNotFoundError, ProductSource, get_source, require_reference
-from app.catalog.repository import asset_path
-from app.core.image_validation import ValidatedImage, validate_image
+from app.catalog.repository import tryon_asset_path
+from app.core.image_validation import validate_image
 from app.services.tryon import (
     TryOnJob,
     TryOnJobStore,
+    TryOnReference,
     get_tryon_job_store,
     start_try_on_job,
 )
@@ -114,14 +115,13 @@ async def start_try_on(
         )
 
     try:
-        require_reference(product)
+        reference = _resolve_reference(product)
     except ProductNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
 
-    reference = _load_reference(product)
     # The catalogue declares the garment category, so the vendor is not asked to
     # guess. An item with no declared category falls back to `auto`, which the
     # V4.0 engine documents as auto-detecting from the reference image.
@@ -166,21 +166,36 @@ async def get_try_on(
     return _to_response(job)
 
 
-def _load_reference(product: Product) -> ValidatedImage:
-    """Read a catalogue garment from disk and validate it like any upload.
+def _resolve_reference(product: Product) -> TryOnReference:
+    """Resolve a product's garment to the transport YouCam expects.
 
-    A bundled asset is validated for the same reasons an upload is: it keeps the
-    runner's contract uniform, and a corrupted or truncated file in the build
-    fails here with a clear log line instead of a vendor error.
+    A live listing carries a public image `url` the vendor fetches itself; a
+    product already in YouCam storage carries a `file_id`; only the bundled demo
+    catalogue has a `local_path`, which has to be read from disk and pushed
+    through the File API like any upload. A bundled asset is validated for the
+    same reasons an upload is: it keeps the runner's contract uniform, and a
+    corrupted or truncated file fails here with a clear log line instead of a
+    vendor error.
     """
-    path = asset_path(product)
+    reference = require_reference(product)
+    if reference.file_id:
+        return TryOnReference(file_id=reference.file_id)
+    if reference.url:
+        return TryOnReference(url=reference.url)
+
+    path = tryon_asset_path(product)
     data = path.read_bytes()
     if len(data) > MAX_REFERENCE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="This garment's reference image is unexpectedly large.",
         )
-    return validate_image(data, label="the reference garment", declared_content_type="image/png")
+    image = validate_image(
+        data,
+        label="the reference garment",
+        declared_content_type=reference.content_type or "image/png",
+    )
+    return TryOnReference(image=image)
 
 
 def _to_response(job: TryOnJob) -> TryOnStatusResponse:
